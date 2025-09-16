@@ -131,7 +131,7 @@ pub fn parse_tensor_literal(literal: &str, dtype: DataType) -> Result<Tensor, St
         ndims: dims.len() as u8,
         dtype,
         flags: 0,
-        nelems: nelems,
+        nelems,
         dims,
         strides,
         buffer,
