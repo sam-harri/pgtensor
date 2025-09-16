@@ -21,9 +21,11 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
 pg_test = []
 
 [dependencies]
+bytemuck = "1.23.2"
 pgrx = "=0.16.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = {version = "1.0" }
+thiserror = "2.0.16"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.0"
