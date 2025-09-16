@@ -4,7 +4,7 @@ use serde_json::{Number as JNumber, Value as JValue};
 use std::convert::TryFrom;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[repr(u8)] // force C repr so it can fit in a u8
 pub enum DataType {
     Float64 = 0x0,
