@@ -96,7 +96,6 @@ impl FromDatum for Tensor {
         is_null: bool,
         typoid: pg_sys::Oid,
     ) -> Option<Self> {
-        let tmp = JsonB::type_oid();
         let jb = JsonB::from_datum(datum, is_null)?;
         let v: JValue = jb.0;
         match serde_json::from_value::<Tensor>(v) {
@@ -147,7 +146,6 @@ where
     }
 }
 
-
 // BoxRet is the opposite, “given a T, put it back into fcinfo as a return value”
 // calls IntoDatum and then fcinfo.return_raw_datum(...)
 // basically how to write a result back into Postgres’ calling convention
@@ -166,7 +164,7 @@ unsafe impl BoxRet for Tensor {
 // this runs when parsing a value literal of our type, like '[[[...]]]'
 // Postgres gives us the string literal, the OID of our type, and the typmod.
 // basically parse the JSON styled nested lists into our Tensor type
-// Look at the 
+// Look at the
 #[pg_extern(immutable, strict, parallel_safe, requires = ["shell_type"])]
 fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
     let s = input.to_str().expect("tensor input must be valid UTF-8");
@@ -176,7 +174,7 @@ fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
     // tensor(1,2,3,"f64") or tensor(4,5,"i32")
     // easy to implement but I just dont feel like doing that rn (just want MVP)
     let dtype = DataType::Float64;
-    let tensor = tensor_core::parse_tensor_literal(s, dtype).unwrap_or_else(|e| pgrx::error!("{}", e));
+    let tensor = Tensor::from_literal(s, dtype).unwrap_or_else(|e| pgrx::error!("{}", e));
 
     if type_modifier != -1 {
         let (expected_ndims, dtype, expected_nelems) = unpack_typmod(type_modifier);
@@ -197,11 +195,11 @@ fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
             );
         }
 
-        if tensor.buffer.len() != expected_buffer_length {
+        if tensor.elem_buffer.len() != expected_buffer_length {
             pgrx::error!(
                 "buffer length mismatch, expected {}, found {}", // probably a dtype error?
                 expected_ndims,
-                tensor.buffer.len()
+                tensor.elem_buffer.len()
             );
         }
     }
@@ -215,7 +213,7 @@ fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
 // our literal format and hand it to Postgres as a CString.
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
 fn tensor_output(tensor: Tensor) -> CString {
-    let string_repr = tensor_core::to_literal(&tensor);
+    let string_repr = tensor.to_literal().unwrap();
     CString::new(string_repr).expect("there should be no NUL in the middle")
 }
 
@@ -244,11 +242,15 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
 // and format it back into a human-readable string
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
 fn tensor_modifier_output(type_modifier: i32) -> CString {
-    let (ndims, dtype, nelems ) = unpack_typmod(type_modifier);
-    CString::new(format!("(Tensor ndims={} dtype={} nelems={})", ndims, dtype, nelems)).expect("no NUL in the middle")
+    let (ndims, dtype, nelems) = unpack_typmod(type_modifier);
+    CString::new(format!(
+        "(Tensor ndims={} dtype={} nelems={})",
+        ndims, dtype, nelems
+    ))
+    .expect("no NUL in the middle")
 }
 
-// cast a tensor to a tensor, the conversion is meaningless but we need it to 
+// cast a tensor to a tensor, the conversion is meaningless but we need it to
 // do the rank/nelems/dtype checks
 // At parse time, postgres calls our tensor_input function but with a typmod of -1
 // because it does not yet have access to the table's atttypmod attribute which holds the typmod
@@ -279,7 +281,7 @@ fn cast_tensor_to_tensor(tensor: Tensor, type_modifier: i32, _explicit: bool) ->
         );
     }
 
-    if tensor.buffer.len() != expected_buffer_length {
+    if tensor.elem_buffer.len() != expected_buffer_length {
         pgrx::error!(
             "buffer length mismatch, expected {}, found {}", // probably a dtype error?
             expected_ndims,
