@@ -64,7 +64,7 @@ mod tests {
         let t_output: tensor_core::Tensor = Spi::get_one::<tensor_core::Tensor>(
             "SELECT elemwise_add('[[1,2.0],[3,4]]', '[[10,20.0],[30,40]]');",
         )?
-        .ok_or("elemwise_add returned NULL")?; // <-- unwrap Option, bubble error
+        .ok_or("elemwise_add returned NULL")?;
 
         let t_expected = "[[11.0,22],[33,44]]".parse::<tensor_core::Tensor>()?;
         assert_eq!(t_expected, t_output);
@@ -74,11 +74,9 @@ mod tests {
 
     #[pg_test]
     fn test_bgworker_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        // start a worker
         let started: bool = Spi::get_one("SELECT load_bgworker('alpha')")?.unwrap();
         assert!(started);
 
-        // send a tensor to the worker, it should echo back
         let echoed: crate::tensor_core::Tensor =
             Spi::get_one("SELECT to_bgworker('alpha', '[[1,2],[3,4]]'::tensor)")?
                 .ok_or("worker did not respond")?;
@@ -92,17 +90,12 @@ mod tests {
     }
 }
 
-/// This module is required by `cargo pgrx test` invocations.
-/// It must be visible at the root of your extension crate.
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
+    pub fn setup(_options: Vec<&str>) {}
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
         vec!["shared_preload_libraries = 'pgtensor'"]
     }
 }
