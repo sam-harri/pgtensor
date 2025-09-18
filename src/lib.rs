@@ -1,6 +1,7 @@
 #![allow(unused)]
 
 mod dynamic_bgworker;
+mod onnx_runtime;
 mod tensor_core;
 mod tensor_pg;
 

@@ -27,6 +27,7 @@ pub trait PgSharedMemoryInitialization {
     type Value: PGRXSharedMemory;
 
     // please budget me N bytes and a tranche of LWLocks
+    // from here on out, when you see tranche just think an array of LWLocks
     // C API: RequestAddinShmemSpace(size) + RequestNamedLWLockTranche(name, n)
     unsafe fn on_shmem_request(&'static self);
 
@@ -265,7 +266,6 @@ impl Ring {
     }
 }
 
-
 // each worker process has its own state
 // name will be for the name of the ONNX model is has loaded
 // then queue_idx is it's the location of it's msg in the queue
@@ -301,7 +301,6 @@ impl WorkerEntry {
         std::str::from_utf8(&self.name[..len]).unwrap_or("") // gotta add a error jawn here
     }
 }
-
 
 // shared state that the LWLock protects
 // contains all the workes and ring used for message passing
@@ -431,7 +430,6 @@ unsafe fn set_latch_for_pid(pid: pg_sys::pid_t) {
     }
 }
 
-
 // for now I have the most simple thing going where you just dynamically load a background
 // worker. for hte inference we'll need to load up the ONNX runtime and the ONNX model
 // in the initialization
@@ -499,7 +497,6 @@ pub fn load_bgworker(name: &str) -> bool {
         }
     }
 }
-
 
 // once you have a worker created (aka when the model is loaded later)
 // you can send tensors over the shmem block

@@ -54,6 +54,30 @@ impl Tensor {
             elem_buffer: out_vec,
         })
     }
+
+    pub fn ones(dims: Vec<u32>) -> Result<Tensor, TensorError> {
+        let ndims = dims.len();
+        let nelems: u32 = dims.iter().product();
+        let flags = 0;
+        let mut strides = vec![0u32; dims.len()];
+        let mut acc: u128 = 1;
+        for i in (0..dims.len()).rev() {
+            strides[i] = u32::try_from(acc).map_err(|_| TensorError::Overflow)?;
+            acc = acc
+                .checked_mul(dims[i] as u128)
+                .ok_or(TensorError::Overflow)?;
+        }
+        let elem_buffer = vec![1.0; nelems as usize];
+
+        Ok(Tensor {
+            ndims: ndims as u8,
+            flags,
+            nelems,
+            dims,
+            strides,
+            elem_buffer,
+        })
+    }
 }
 
 impl FromStr for Tensor {
@@ -272,6 +296,14 @@ mod tests {
             Into::<String>::into(c),
             "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ones() -> Result<(), Box<dyn Error>> {
+        let t1 = Tensor::ones(vec![1, 2]);
+        let t2 = "[[1,1]]".parse::<Tensor>()?;
+        assert_eq!(t2, t2);
         Ok(())
     }
 }
