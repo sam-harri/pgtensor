@@ -1,4 +1,5 @@
 // postgres glue for the tensor_core interface
+use crate::tensor_core::{self, Tensor};
 use core::ffi::CStr;
 use pgrx::callconv::{ArgAbi, BoxRet};
 use pgrx::datum::{FromDatum, IntoDatum, JsonB};
@@ -9,18 +10,17 @@ use pgrx::prelude::*;
 use pgrx::wrappers::rust_regtypein;
 use serde_json::Value as JValue;
 use std::ffi::CString;
-
-use crate::tensor_core::{self, DataType, Tensor};
+use std::str::FromStr;
 
 // typmod is metadata we have access to on insert to validate a record
 // we only have 32 bits, so gotta make them count. I have ideas to make this better later
 // for now this is what im going with
 // 32-bit typmod layout
-// [************************|****|****]
-//  ^24b                     ^4b  ^4b
-// nelems                   dtype ndims
+// [*****************************|****]
+//  ^28b                           ^4b
+// nelems                         ndims
 // also did you know a group of 4 bits is called a nibble haha
-pub fn pack_typmod(ndims: u8, dtype: DataType, dims: &[i32]) -> i32 {
+pub fn pack_typmod(ndims: u8, dims: &[i32]) -> i32 {
     let mut nelems: u64 = 1;
     for &d in dims {
         assert!(d >= 0, "dims must be non-negative");
@@ -30,12 +30,11 @@ pub fn pack_typmod(ndims: u8, dtype: DataType, dims: &[i32]) -> i32 {
     assert!(ndims <= 0x0F, "ndims must fit in 4 bits (0..15)");
 
     let nd = ndims as u32;
-    let dt = dtype as u32;
     // bit mask to stop the nel from being more than 24 bits
     // will need proper validation
-    let nel = (nelems as u32) & 0x00FF_FFFF;
+    let nel = (nelems as u32) & 0x0FFF_FFFF;
 
-    ((nel << 8) | (dt << 4) | nd) as i32
+    ((nel << 4) | nd) as i32
 }
 
 // note: unpacking typmod is lossy.
@@ -55,16 +54,14 @@ pub fn pack_typmod(ndims: u8, dtype: DataType, dims: &[i32]) -> i32 {
 // (first dim in bits 0–11, second dim in bits 12–23) and still
 // have room for dtype/ndims. Beyond rank-3 this breaks down,
 // since 24 bits can’t represent enough per-dimension information
-pub fn unpack_typmod(typmod: i32) -> (u8, DataType, u32) {
+pub fn unpack_typmod(typmod: i32) -> (u8, u32) {
     assert!(typmod != -1, "typmod is unknown (-1)");
     let t = typmod as u32;
 
-    let nd = (t & 0x0F) as u8;
-    let dt4 = ((t >> 4) & 0x0F) as u8;
-    let nel = (t >> 8) & 0x00FF_FFFF;
+    let nd = (t & 0xF) as u8;
+    let nel = (t >> 4) & 0x0FFF_FFFF;
 
-    let dtype = DataType::try_from(dt4).expect("invalid dtype nibble in typmod");
-    (nd, dtype, nel)
+    (nd, nel)
 }
 
 // tells pgrx how to map the Rust Tensor type to SQL in the generated SQL
@@ -96,11 +93,14 @@ impl FromDatum for Tensor {
         is_null: bool,
         typoid: pg_sys::Oid,
     ) -> Option<Self> {
-        let jb = JsonB::from_datum(datum, is_null)?;
-        let v: JValue = jb.0;
-        match serde_json::from_value::<Tensor>(v) {
+        if is_null {
+            return None;
+        }
+        let bytes: &[u8] = <&[u8]>::from_polymorphic_datum(datum, is_null, typoid)?;
+
+        match serde_cbor::from_slice::<Tensor>(bytes) {
             Ok(t) => Some(t),
-            Err(e) => pgrx::error!("failed to deserialize Tensor from jsonb: {}", e),
+            Err(e) => pgrx::error!("failed to deserialize Tensor from CBOR: {}", e),
         }
     }
 }
@@ -110,11 +110,11 @@ impl FromDatum for Tensor {
 // the rust_regtypein is a pgrx macro that tells postgres what SQL type OID corresponds to this Rust type
 impl IntoDatum for Tensor {
     fn into_datum(self) -> Option<pg_sys::Datum> {
-        let v = match serde_json::to_value(&self) {
+        let v = match serde_cbor::to_vec(&self) {
             Ok(v) => v,
-            Err(e) => pgrx::error!("failed to serialize Tensor to jsonb: {}", e),
+            Err(e) => pgrx::error!("failed to serialize Tensor to CBOR: {}", e),
         };
-        JsonB(v).into_datum()
+        v.into_datum()
     }
     fn type_oid() -> pg_sys::Oid {
         rust_regtypein::<Self>()
@@ -168,17 +168,10 @@ unsafe impl BoxRet for Tensor {
 #[pg_extern(immutable, strict, parallel_safe, requires = ["shell_type"])]
 fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
     let s = input.to_str().expect("tensor input must be valid UTF-8");
-
-    // hard coding f64 for now, but later we should add parsing so that you can optionally
-    // pass in the datatype, like so
-    // tensor(1,2,3,"f64") or tensor(4,5,"i32")
-    // easy to implement but I just dont feel like doing that rn (just want MVP)
-    let dtype = DataType::Float64;
-    let tensor = Tensor::from_literal(s, dtype).unwrap_or_else(|e| pgrx::error!("{}", e));
+    let tensor = Tensor::from_str(s).unwrap_or_else(|e| pgrx::error!("{}", e));
 
     if type_modifier != -1 {
-        let (expected_ndims, dtype, expected_nelems) = unpack_typmod(type_modifier);
-        let expected_buffer_length = dtype.size_of() * expected_nelems as usize;
+        let (expected_ndims, expected_nelems) = unpack_typmod(type_modifier);
         if tensor.nelems != expected_nelems {
             pgrx::error!(
                 "nelems mismatch, expected {}, found {}",
@@ -194,14 +187,6 @@ fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
                 tensor.ndims
             );
         }
-
-        if tensor.elem_buffer.len() != expected_buffer_length {
-            pgrx::error!(
-                "buffer length mismatch, expected {}, found {}", // probably a dtype error?
-                expected_ndims,
-                tensor.elem_buffer.len()
-            );
-        }
     }
 
     tensor
@@ -213,28 +198,44 @@ fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
 // our literal format and hand it to Postgres as a CString.
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
 fn tensor_output(tensor: Tensor) -> CString {
-    let string_repr = tensor.to_literal().unwrap();
+    let string_repr: String = tensor.into();
     CString::new(string_repr).expect("there should be no NUL in the middle")
 }
 
 // when you create a table like so CREATE TABLE t (x tensor(2,3,4));
 // this function will receive the args as a list of CStrings, so ["2", "3", "4"]
 // parse the dim sizes and create the typmod so we can validate tensor entries
-// Want to support changin the tensor scalar type like tensor(2,3,4,"f64")
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
 fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
-    let dims = list
+    let mut parts: Vec<&str> = list
         .iter()
-        .map(|cstr| cstr.unwrap().to_str().unwrap())
-        .map(str::trim)
-        .map(|t| t.parse::<i32>())
-        .collect::<Result<Vec<i32>, _>>()
-        .expect("each dimension must be a valid i32");
-    let ndims = u8::try_from(dims.len()).expect("too many dimensions (max 15)");
-    assert!(ndims <= 0x0F, "too many dimensions (max 15)");
-    // hard coding float64 only for now
-    let typmod = DataType::Float64;
-    pack_typmod(ndims, typmod, &dims)
+        .map(|c| c.unwrap().to_str().unwrap().trim())
+        .collect();
+
+    if parts.is_empty() {
+        pgrx::error!("tensor(...) requires at least one dimension");
+    }
+
+    let dims: Vec<i32> = parts
+        .iter()
+        .map(|&s| {
+            s.parse::<i32>().unwrap_or_else(|_| {
+                pgrx::error!(r#"invalid dimension "{s}" (must be a 32-bit integer)"#)
+            })
+        })
+        .collect();
+
+    if dims.iter().any(|&d| d < 0) {
+        pgrx::error!("dimensions must be non-negative");
+    }
+
+    let ndims =
+        u8::try_from(dims.len()).unwrap_or_else(|_| pgrx::error!("too many dimensions (max 15)"));
+    if ndims > 0x0F {
+        pgrx::error!("too many dimensions (max 15)");
+    }
+
+    pack_typmod(ndims, &dims)
 }
 
 // used to display the type mod
@@ -242,12 +243,8 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
 // and format it back into a human-readable string
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
 fn tensor_modifier_output(type_modifier: i32) -> CString {
-    let (ndims, dtype, nelems) = unpack_typmod(type_modifier);
-    CString::new(format!(
-        "(Tensor ndims={} dtype={} nelems={})",
-        ndims, dtype, nelems
-    ))
-    .expect("no NUL in the middle")
+    let (ndims, nelems) = unpack_typmod(type_modifier);
+    CString::new(format!("(ndims={} nelems={})", ndims, nelems)).expect("no NUL in the middle")
 }
 
 // cast a tensor to a tensor, the conversion is meaningless but we need it to
@@ -262,8 +259,7 @@ fn tensor_modifier_output(type_modifier: i32) -> CString {
 // That’s our chance to validate shape/rank/etc, then return the value unchanged if it's good
 #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
 fn cast_tensor_to_tensor(tensor: Tensor, type_modifier: i32, _explicit: bool) -> Tensor {
-    let (expected_ndims, dtype, expected_nelems) = unpack_typmod(type_modifier);
-    let expected_buffer_length = dtype.size_of() * expected_nelems as usize;
+    let (expected_ndims, expected_nelems) = unpack_typmod(type_modifier);
 
     if tensor.nelems != expected_nelems {
         pgrx::error!(
@@ -276,14 +272,6 @@ fn cast_tensor_to_tensor(tensor: Tensor, type_modifier: i32, _explicit: bool) ->
     if tensor.ndims != expected_ndims {
         pgrx::error!(
             "ndims mismatch, expected {}, found {}",
-            expected_ndims,
-            tensor.ndims
-        );
-    }
-
-    if tensor.elem_buffer.len() != expected_buffer_length {
-        pgrx::error!(
-            "buffer length mismatch, expected {}, found {}", // probably a dtype error?
             expected_ndims,
             tensor.ndims
         );
@@ -329,3 +317,10 @@ extension_sql!(
     name = "cast_tensor_to_tensor",
     requires = ["concrete_type", cast_tensor_to_tensor]
 );
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn elemwise_add(t1: Tensor, t2: Tensor) -> Tensor {
+    Tensor::elemwise_add(&t1, &t2)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
