@@ -1,41 +1,21 @@
 # pgtensor
 
-Open-source Postgres extension that adds a `tensor` type with fixed shape and dtype. Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) for Rust.
+Open-source Postgres extension that adds a `tensor`  type, and an ONNX inference engine using dynamic worker processes. Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) for Rust.
 
 -   Define columns like `tensor(2,3)`
-    
--   Insert with simple literals like `'[[0,1,2],[2,3,4]]'`
-    
--   Cast from scalars and arrays, e.g. `'[1]'::tensor`
+-   Insert with simple literals like `'[[0,1,2],[2,3,4]]'`, and validate shapes
+-   Load ONNX models into background processes, and run inference on stored tensors
+-   Compatible with Postgres versions 13-17
 
-## Roadmap
-
-- [ ] `load_model(path => text)` function to load ONNX models into background workers for inference  
-- [ ] SQL API for running inference against loaded models  
+## Roadmap 
+- [ ] Support multiple dtype tensors (f16, f32, i32, i64), currently only supporting f64
 - [ ] Flexible `tensor` column type supporting different lengths and dtypes in the same column
+- [ ] Support tensor operations, and vector opertions for Rank 1 tensors
+- [ ] Better synchronization, move from 1 lock for the entire shared memory queue to a lock per slot in queue
 
+## API overview
 
-## Install
-
-Requirements: Postgres (13+, ideally 17), Rust, and pgrx.
-
-```sh
-# one-time pgrx setup (points pgrx at your local Postgres)
-cargo install --locked cargo-pgrx
-cargo pgrx init
-
-# build and run the extension into Postgres, interactive through `psql`
-cargo pgrx run
-
-# or create installation package
-cargo pgrx package
-```
-
-If you have multiple Postgres versions, pass `--pg-config` to `cargo pgrx install`.
-
-## Getting started
-
-In each database where you want to use it:
+Load up the extention :
 
 ```sql
 CREATE EXTENSION pgtensor;
@@ -60,18 +40,46 @@ Cast from a literal:
 SELECT '[1]'::tensor;
 ```
 
-## Development
+Run inference : 
 
-Common commands:
+First load a model from `/var/lib/postgresql/pgtensor_model`
+
+```sql
+SELECT load_model('sigmoid','x','y');
+```
+
+where the first arg is the model name, so `sigmoid.onnx`,
+and the next 2 args are the input and output tensor names, respectivly
+
+Then run an inference call
+
+```sql
+SELECT run_inference('sigmoid', '[1]');
+```
+
+using the model name as the first arg, and the tensor you want to run inference on in the second
+
+Which will return the tensor `'[0.7310585786300049]'`
+
+## Install
+
+Requirements: Postgres (13+, ideally 17), Rust, and pgrx.
 
 ```sh
-# start a dev Postgres with the extension available
-cargo pgrx run
+# one-time pgrx setup
+cargo install --locked cargo-pgrx
+cargo pgrx init
 
-# rebuild & reinstall after changes
-cargo pgrx install
+# build and run the extension into Postgres, interactive through `psql`
+cargo pgrx run
+# and optionally specify a version
+cargo pgrx run pg13
+
+# You can also install the package using
+cargo pgrx package
+# for release mode use
+cargo pgrx install --release
 ```
-    
 
 ## License
 
