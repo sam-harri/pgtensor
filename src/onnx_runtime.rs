@@ -117,7 +117,7 @@ mod tests {
     fn test_sigmoid_constant_input_runs() -> Result<(), Box<dyn std::error::Error>> {
         let t = T::ones(vec![3, 4, 5])?;
 
-        let mut sess = InferenceSession::new("models/f64_sigmoid.onnx", "x", "y")?;
+        let mut sess = InferenceSession::new("models/sigmoid.onnx", "x", "y")?;
         let out = sess.infer(t.clone()).expect("inference should succeed");
 
         assert_eq!(out.dims, vec![3, 4, 5]);

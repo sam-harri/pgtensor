@@ -1,9 +1,9 @@
 #![allow(unused)]
 
-mod dynamic_bgworker;
-mod onnx_runtime;
-mod tensor_core;
 mod tensor_pg;
+mod tensor_core;
+mod onnx_runtime;
+mod dynamic_bgworker;
 
 use pgrx::prelude::*;
 use std::error::Error;
@@ -16,7 +16,7 @@ mod tests {
     use pgrx::prelude::*;
     use std::error::Error;
 
-    use crate::tensor_core::{self};
+    use crate::tensor_core::{self, Tensor};
 
     #[pg_test]
     fn test_create_table() -> Result<(), Box<dyn Error>> {
@@ -74,18 +74,31 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_bgworker_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        let started: bool = Spi::get_one("SELECT load_bgworker('alpha')")?.unwrap();
-        assert!(started);
+    fn test_onnx_sigmoid_bgworker_infers() -> Result<(), Box<dyn std::error::Error>> {
+        let started: bool = Spi::get_one("SELECT load_model('sigmoid','x','y')")?.unwrap();
+        assert!(started, "bgworker failed to start");
 
-        let echoed: crate::tensor_core::Tensor =
-            Spi::get_one("SELECT to_bgworker('alpha', '[[1,2],[3,4]]'::tensor)")?
-                .ok_or("worker did not respond")?;
-
-        assert_eq!(
-            echoed,
-            "[[2,3],[4,5]]".parse::<crate::tensor_core::Tensor>()?
+        let t_str: String = crate::tensor_core::Tensor::ones(vec![3, 4, 5])?.into();
+        let query = format!(
+            "SELECT run_inference('sigmoid', '{}')",
+            t_str
         );
+        let out: crate::tensor_core::Tensor = Spi::get_one(&query)?
+        .ok_or("run_inference returned NULL")?;
+
+        assert_eq!(out.dims, vec![3, 4, 5]);
+        assert_eq!(out.ndims, 3);
+        assert_eq!(out.nelems, 60);
+        assert_eq!(out.strides, vec![20, 5, 1]);
+
+        // value check, sigmoid(1) ~= 0.7310585786300049
+        let expected = 0.731_058_578_630_0049_f64;
+        for (i, &x) in out.elem_buffer.iter().enumerate() {
+            assert!(
+                (x - expected).abs() < 1e-6,
+                "elem {i}: got {x}, expected ~{expected}"
+            );
+        }
 
         Ok(())
     }
@@ -93,7 +106,10 @@ mod tests {
 
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {}
+    pub fn setup(_options: Vec<&str>) {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/models");
+        std::env::set_var("PGTENSOR_MODELS_DIR", base);
+    }
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {

@@ -430,17 +430,24 @@ unsafe fn set_latch_for_pid(pid: pg_sys::pid_t) {
     }
 }
 
-// for now I have the most simple thing going where you just dynamically load a background
-// worker. for hte inference we'll need to load up the ONNX runtime and the ONNX model
-// in the initialization
-#[pg_extern]
-pub fn load_bgworker(name: &str) -> bool {
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["cast_tensor_to_tensor"])]
+pub fn load_model(name: &str, input_var: &str, output_var: &str) -> bool {
+    // simple validations (no ':' because we split on it in worker)
     // we only allocated 64 bytes for the name, and it has to be null terminate cause CStr
-    if name.is_empty() || name.len() > 63 {
-        pgrx::error!("name must be 1..63 chars");
+    if name.is_empty() || name.len() > 63 || name.contains(':') {
+        pgrx::error!("name must be 1..63 chars and cannot contain ':'");
+    }
+    if input_var.contains(':') || output_var.contains(':') {
+        pgrx::error!("input/output names cannot contain ':'");
+    }
+
+    let model_path = resolve_model_path(&format!("{}.onnx", name));
+    if !model_path.exists() {
+        pgrx::error!("model file not found: {}", model_path.display());
     }
 
     // find the first unused index in the worker arr
+    // block for reserving a spot in the queue
     let mut queue_idx: i32 = -1;
     {
         let mut g = SHMEM.exclusive();
@@ -465,12 +472,15 @@ pub fn load_bgworker(name: &str) -> bool {
         }
     }
 
-    // actually start the worker
+    // start the worker, pass queue_idx:name:input:output
     let mut builder = BackgroundWorkerBuilder::new("tensor_bgworker");
     let builder = builder
-        .set_function("tensor_worker_main")
-        .set_library("pgtensor") // not sure what env var we have access to so hardcoding for now
-        .set_extra(&format!("{}:{}", queue_idx, name))
+        .set_function("inference_worker_main")
+        .set_library("pgtensor")// not sure what env var we have access to so hardcoding for now
+        .set_extra(&format!(
+            "{}:{}:{}:{}",
+            queue_idx, name, input_var, output_var
+        ))
         .set_notify_pid(unsafe { pg_sys::MyProcPid })
         .enable_spi_access();
 
@@ -482,7 +492,6 @@ pub fn load_bgworker(name: &str) -> bool {
                     pgrx::error!("failed to start bgworker \"{}\": {:?}", name, s);
                 })
                 .unwrap();
-
             let mut g = SHMEM.exclusive();
             g.workers[queue_idx as usize].pid = pid;
             true
@@ -500,9 +509,9 @@ pub fn load_bgworker(name: &str) -> bool {
 
 // once you have a worker created (aka when the model is loaded later)
 // you can send tensors over the shmem block
-#[pg_extern]
-pub fn to_bgworker(name: &str, t: Tensor) -> Tensor {
-    // find worker by it's name. This will be the model name
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["cast_tensor_to_tensor"])]
+pub fn run_inference(name: &str, t: Tensor) -> Tensor {
+    // find worker by it's name (aka the name of the model you have loaded)
     let (qidx, pid) = {
         let g = SHMEM.share();
         let w = g
@@ -585,27 +594,42 @@ pub fn to_bgworker(name: &str, t: Tensor) -> Tensor {
     }
 }
 
-// program/method the worker processes are running
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn tensor_worker_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn inference_worker_main(_arg: pg_sys::Datum) {
+    use crate::onnx_runtime::InferenceSession;
+
     let extra = BackgroundWorker::get_extra();
-    let (qidx, wname) = {
-        let mut it = extra.splitn(2, ':');
+    // expected: "qidx:name:input:output"
+    let (qidx, model_name, input_var, output_var) = {
+        let mut it = extra.splitn(4, ':');
         let idx = it.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
-        let nm = it.next().unwrap_or("unnamed").to_owned();
-        (idx, nm)
+        let name = it.next().unwrap_or("unnamed").to_owned();
+        let ivar = it.next().unwrap_or("x").to_owned();
+        let ovar = it.next().unwrap_or("y").to_owned();
+        (idx, name, ivar, ovar)
     };
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
-    log!("tensor_worker \"{}\" started on queue {}", wname, qidx);
+    // Resolve "<models_dir>/<model_name>.onnx"
+    let model_path = resolve_model_path(&format!("{}.onnx", model_name));
+    log!("inference_worker \"{}\" starting on queue {} with model {}", model_name, qidx, model_path.display());
 
-    // waiting for the latch from to_bgworker
+    // Build the ONNX session once per worker
+    let mut session = match InferenceSession::new(&model_path, &input_var, &output_var) {
+        Ok(s) => s,
+        Err(e) => {
+            log!("inference_worker[{}]: failed to create session: {}", model_name, e);
+            // Bail out; caller will see worker not running on next attempt.
+            return;
+        }
+    };
+
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(200))) {
         loop {
-            // then pop the message when it's ready
+            // pop a pending message
             let (have, msg) = {
                 let mut g = SHMEM.exclusive();
                 let ring = &mut g.queues[qidx];
@@ -617,7 +641,7 @@ pub extern "C-unwind" fn tensor_worker_main(_arg: pg_sys::Datum) {
                     if m.state != MsgState::Pending {
                         (false, Msg::empty())
                     } else {
-                        let local = *m; // copy out
+                        let local = *m; // copy out so we can drop lock before running ONNX
                         ring.tail = ring.tail.wrapping_add(1);
                         (true, local)
                     }
@@ -627,38 +651,33 @@ pub extern "C-unwind" fn tensor_worker_main(_arg: pg_sys::Datum) {
                 break;
             }
 
-            // decode the CBOR repr of the tensor we sent through
+            // decode tensor
             let t: Tensor = match serde_cbor::from_slice(&msg.req[..msg.req_len as usize]) {
                 Ok(v) => v,
                 Err(e) => {
-                    log!("tensor_worker decode error: {}", e);
+                    log!("inference_worker[{}] decode error: {}", model_name, e);
                     continue;
                 }
             };
 
-            // now we're fully in Rust land. This is where we'll run our inference, most likely
-            // through a better abstracted
-            let mut t_plus = t.clone();
-            for x in &mut t_plus.elem_buffer {
-                *x += 1.0;
-            }
+            // run inference
+            let out_tensor = match session.infer(t) {
+                Ok(o) => o,
+                Err(e) => {
+                    log!("inference_worker[{}] infer error: {}", model_name, e);
+                    continue;
+                }
+            };
 
-            // logging for now for debug purposes
-            let _ = BackgroundWorker::transaction(|| {
-                Spi::connect(|_| {
-                    let s_in: String = t.clone().into();
-                    let s_out: String = t_plus.clone().into();
-                    log!("tensor_worker[{}] IN : {}", wname, s_in);
-                    log!("tensor_worker[{}] OUT: {}", wname, s_out);
-                    Ok::<(), pgrx::spi::Error>(())
-                })
-            });
+            // encode and write response back to same slot (tail-1)
+            let out = match serde_cbor::to_vec(&out_tensor) {
+                Ok(v) => v,
+                Err(e) => {
+                    log!("inference_worker[{}] encode error: {}", model_name, e);
+                    continue;
+                }
+            };
 
-            // once we're run out inference and get a Tensor backout
-            // encode is back into cbor
-            let out = serde_cbor::to_vec(&t_plus).unwrap();
-
-            // and write response back to the same slot (tail-1)
             {
                 let mut g = SHMEM.exclusive();
                 let ring = &mut g.queues[qidx];
@@ -668,12 +687,32 @@ pub extern "C-unwind" fn tensor_worker_main(_arg: pg_sys::Datum) {
                 m.resp[..n].copy_from_slice(&out[..n]);
                 m.resp_len = n as u16;
                 m.state = MsgState::Done;
-                unsafe {
-                    set_latch_for_pid(msg.caller_pid);
-                }
+                unsafe { set_latch_for_pid(msg.caller_pid); }
             }
         }
     }
 
-    log!("tensor_worker \"{}\" shutting down", wname);
+    log!("inference_worker \"{}\" shutting down", model_name);
+}
+
+
+
+// some helpers that we can probably more aptly place
+fn models_base_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    // Dev/tests can set this,but prod falls back to the fixed dir
+    if let Ok(s) = std::env::var("PGTENSOR_MODELS_DIR") {
+        return PathBuf::from(s);
+    }
+    PathBuf::from("/var/lib/postgresql/pgtensor_model")
+}
+
+fn resolve_model_path(rel: &str) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    let base = models_base_dir();
+    let p = Path::new(rel);
+    if p.is_absolute() || rel.contains("..") {
+        pgrx::error!("invalid model path: must be relative and not contain '..'");
+    }
+    base.join(p)
 }
