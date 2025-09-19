@@ -326,12 +326,12 @@ const LW_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"tensor_bg\
 #[allow(non_upper_case_globals)]
 static SHMEM: PgLwLock<SharedState> = unsafe { PgLwLock::new(LW_NAME) };
 
-// Pre pg16, extentions could request shmem in _PG_init(), then initialize in shmem_startup_hook
-// Starting in pg16 though, a new shmem_request_hook was added and postgres required that all shared-memory
+// Pre pg15, extentions could request shmem in _PG_init(), then initialize in shmem_startup_hook
+// Starting in pg15 though, a new shmem_request_hook was added and postgres required that all shared-memory
 // requests happen there (not in _PG_init() or shmem_startup_hook). Initialization
 // still happens in shmem_startup_hook though
 // really what we're doing here is building the _PG_init fn, and we do so differently based on the pg version
-#[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+#[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
 mod shmem_hooks {
     use super::*;
     // hook to request the shmem
@@ -378,7 +378,7 @@ mod shmem_hooks {
     }
 }
 
-#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+#[cfg(any(feature = "pg13", feature = "pg14"))]
 mod shmem_hooks {
     use super::*;
     // no need for a request hook since we request right in the _PG_init

@@ -1,0 +1,83 @@
+name: pgrx CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [pg13, pg14, pg15, pg16, pg17, pg18]
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      PGRX_HOME: ${{ github.workspace }}/.pgrx-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libreadline-dev zlib1g-dev flex \
+            bison libxml2-dev libxslt-dev libssl-dev \
+            libxml2-utils xsltproc ccache pkg-config \
+            libclang-dev perl libperl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust version
+        id: rustv
+        run: echo "rustc=$(rustc --version | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo (registries/git + target)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ steps.rustv.outputs.rustc }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.rustv.outputs.rustc }}-
+            cargo-${{ runner.os }}-
+      - name: Cache cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargobin-${{ runner.os }}-pgrx0160-${{ steps.rustv.outputs.rustc }}
+      - name: Cache PGRX_HOME (postgres builds)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PGRX_HOME }}
+          key: pgrxhome-${{ runner.os }}-pgrx0160-${{ steps.rustv.outputs.rustc }}
+          restore-keys: |
+            pgrxhome-${{ runner.os }}-pgrx0160-
+      - name: Ensure cargo-pgrx 0.16.0
+        run: |
+          set -euo pipefail
+          WANT="cargo-pgrx 0.16.0"
+          HAVE="$(cargo pgrx --version 2>/dev/null || true)"
+          if [ "$HAVE" != "$WANT" ]; then
+            cargo install --locked cargo-pgrx@0.16.0 --force
+          fi
+          cargo pgrx --version
+      - name: Initialize pgrx for ${{ matrix.pg }}
+        run: |
+          cargo pgrx init --${{ matrix.pg }} download
+          cargo pgrx status
+      - name: Clean stale clusters
+        run: rm -rf target/test-pgdata || true
+      - name: Run tests ${{ matrix.pg }}
+        run: cargo pgrx test ${{ matrix.pg }} -- --nocapture
+      - name: Upload Postgres logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgrx-logs-${{ matrix.pg }}
+          path: |
+            target/test-pgdata/**/logfile
+            target/test-pgdata/**/postgresql.conf
+            target/debug/build/**/out/*.sql
+          if-no-files-found: ignore
