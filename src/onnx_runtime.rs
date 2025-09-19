@@ -1,4 +1,4 @@
-use crate::tensor_core::Tensor as TCTensor;
+use crate::tensor_core::Tensor;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use std::path::Path;
 use thiserror::Error;
@@ -51,7 +51,7 @@ impl InferenceSession {
         })
     }
 
-    pub fn infer(&mut self, t: TCTensor) -> Result<TCTensor, InferenceError> {
+    pub fn infer(&mut self, t: Tensor) -> Result<Tensor, InferenceError> {
         let dims_usize: Vec<usize> = t.dims.iter().map(|&d| d as usize).collect();
         let input = ort::value::Tensor::<f64>::from_array((dims_usize, t.elem_buffer))
             .map_err(|_| InferenceError::InferenceFailed)?;
@@ -97,7 +97,7 @@ impl InferenceSession {
             .ok_or(InferenceError::InferenceFailed)?;
         let nelems = u32::try_from(nelems_u64).map_err(|_| InferenceError::InferenceFailed)?;
 
-        Ok(TCTensor {
+        Ok(Tensor {
             ndims: out_dims.len() as u8,
             flags: 0,
             nelems,
