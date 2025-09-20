@@ -16,7 +16,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      RUST_TEST_NOCAPTURE: 1
       PGRX_HOME: ${{ github.workspace }}/.pgrx-cache
+      PGTENSOR_MODELS_DIR: ${{ github.workspace }}/models 
     steps:
       - uses: actions/checkout@v4
       - name: Install build deps
@@ -70,7 +72,7 @@ jobs:
       - name: Clean stale clusters
         run: rm -rf target/test-pgdata || true
       - name: Run tests ${{ matrix.pg }}
-        run: cargo pgrx test ${{ matrix.pg }} -- --nocapture
+        run: cargo pgrx test ${{ matrix.pg }}
       - name: Upload Postgres logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
