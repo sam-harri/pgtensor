@@ -28,6 +28,8 @@ serde_cbor = "0.11.2"
 serde_json = {version = "1.0" }
 thiserror = "2.0.16"
 ort = "=2.0.0-rc.10"
+bitbybit = "1.4.0"
+arbitrary-int = "2.0.0"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.0"
