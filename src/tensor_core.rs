@@ -13,6 +13,8 @@ pub enum TensorError {
     ShapeMismatch,
     #[error("Overflow during elemwise_add")]
     Overflow,
+    #[error("Negative length dimensions are invalid")]
+    NegativeDimensionError,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -26,6 +28,21 @@ pub struct Tensor {
 }
 
 impl Tensor {
+    pub fn from_dims_and_vec(dims: Vec<u32>, buffer: Vec<f64>) -> Result<Tensor, TensorError>{
+        let nelems = dims.iter().product();
+        let ndims = dims.len() as u8;
+        let strides = Tensor::strides_from_dims(&dims);
+        let flags = 0;
+        Ok(Tensor { 
+            ndims,
+            flags,
+            nelems,
+            dims,
+            strides,
+            elem_buffer: buffer,
+         })
+    }
+
     pub fn elemwise_add(t1: &Tensor, t2: &Tensor) -> Result<Tensor, TensorError> {
         if t1.ndims != t2.ndims || t1.dims != t2.dims {
             return Err(TensorError::ShapeMismatch);
@@ -77,6 +94,16 @@ impl Tensor {
             strides,
             elem_buffer,
         })
+    }
+
+    fn strides_from_dims(dims: &[u32]) -> Vec<u32> {
+        let mut strides = Vec::with_capacity(dims.len());
+        let mut acc = 1;
+        dims
+            .iter()
+            .rev()
+            .for_each(|x| {strides.push(acc); acc *= x;});
+        strides.into_iter().rev().collect()
     }
 }
 
@@ -140,7 +167,7 @@ impl FromStr for Tensor {
         };
 
         let dims = infer_dims(&v)?;
-        if dims.is_empty() || dims.iter().any(|&d| d == 0) {
+        if dims.is_empty() || dims.contains(&0) {
             return Err(TensorError::ShapeMismatch);
         }
 
@@ -194,11 +221,11 @@ impl From<Tensor> for String {
             if dims.len() == 1 {
                 let n = dims[0] as usize;
                 out.push('[');
-                for i in 0..n {
+                for (i, &v) in data.iter().enumerate().take(n) {
                     if i > 0 {
                         out.push(',');
                     }
-                    let elem = data[i];
+                    let elem = v;
                     // formating elems with no frac bits as X.0 so that anything downstream alwasys treats them as floats
                     let formatted_elem = if elem.fract() == 0.0 {
                         format!("{:.1}", elem)
@@ -225,7 +252,7 @@ impl From<Tensor> for String {
         }
 
         assert!(
-            !t.dims.is_empty() && !t.dims.iter().any(|&d| d == 0),
+            !t.dims.is_empty() && !t.dims.contains(&0),
             "Tensor -> String requires non-empty, non-zero dimensions"
         );
         assert_eq!(
@@ -304,6 +331,14 @@ mod tests {
         let t1 = Tensor::ones(vec![1, 2]);
         let t2 = "[[1,1]]".parse::<Tensor>()?;
         assert_eq!(t2, t2);
+        Ok(())
+    }
+
+        #[test]
+    fn test_strides_from_buffer() -> Result<(), Box<dyn Error>> {
+        let dims = vec![2u32, 2, 2];
+        let strides = Tensor::strides_from_dims(&dims);
+        assert_eq!(strides, vec![4u32,2,1]);
         Ok(())
     }
 }
