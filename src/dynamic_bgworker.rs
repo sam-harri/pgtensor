@@ -322,7 +322,7 @@ impl SharedState {
 }
 
 // global LWLock and the shared memory containing the SharedState that it protects)
-const LW_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"tensor_bg\0") };
+const LW_NAME: &CStr = c"tensor_bg";
 #[allow(non_upper_case_globals)]
 static SHMEM: PgLwLock<SharedState> = unsafe { PgLwLock::new(LW_NAME) };
 
