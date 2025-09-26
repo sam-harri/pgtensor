@@ -13,7 +13,7 @@ use std::error::Error;
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use pgrx::prelude::*;
+    use pgrx::{datum::TryFromDatumError, pg_sys::Oid, prelude::*, spi::SpiError};
     use std::error::Error;
 
     use crate::tensor_core::{self, Tensor};
@@ -25,7 +25,16 @@ mod tests {
 
             INSERT INTO t VALUES ('[[0,1,2],[2,3,4]]');
             ",
-        );
+        )?;
+        Ok(())
+    }
+
+    #[pg_test(
+        error = "dimension hash mismatch, potentially incorrect dimensions, expected 0x1c7, found 0x14c"
+    )]
+    fn test_typmod_hash() -> Result<(), Box<dyn Error>> {
+        Spi::run("CREATE TABLE t (x tensor(2,3));")?;
+        Spi::run("INSERT INTO t VALUES ('[[0,1],[2,2],[3,4]]');")?;
         Ok(())
     }
 
@@ -34,7 +43,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE t (x tensor(1));
             ",
-        );
+        )?;
 
         let typ = Spi::get_one::<String>(
             r#"

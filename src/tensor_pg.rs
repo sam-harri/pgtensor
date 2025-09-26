@@ -1,8 +1,12 @@
 // postgres glue for the tensor_core interface
 use crate::tensor_core::{self, Tensor};
+use arbitrary_int::traits::Integer;
+use arbitrary_int::{u10, u26, u31, u4, TryNewError};
+use bitbybit::bitfield;
 use core::ffi::CStr;
 use pgrx::callconv::{ArgAbi, BoxRet};
 use pgrx::datum::{FromDatum, IntoDatum, JsonB};
+use pgrx::pg_sys::AsPgCStr;
 use pgrx::pgrx_sql_entity_graph::metadata::{
     ArgumentError, Returns, ReturnsError, SqlMapping, SqlTranslatable,
 };
@@ -10,58 +14,114 @@ use pgrx::prelude::*;
 use pgrx::wrappers::rust_regtypein;
 use serde_json::Value as JValue;
 use std::ffi::CString;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
 
-// typmod is metadata we have access to on insert to validate a record
-// we only have 32 bits, so gotta make them count. I have ideas to make this better later
-// for now this is what im going with
-// 32-bit typmod layout
-// [*****************************|****]
-//  ^28b                           ^4b
-// nelems                         ndims
-// also did you know a group of 4 bits is called a nibble haha
-pub fn pack_typmod(ndims: u8, dims: &[i32]) -> i32 {
-    let mut nelems: u64 = 1;
-    for &d in dims {
-        assert!(d >= 0, "dims must be non-negative");
-        nelems *= d as u64;
-    }
-    assert!(nelems <= 0x00FF_FFFF, "nelem too large for 24-bit");
-    assert!(ndims <= 0x0F, "ndims must fit in 4 bits (0..15)");
-
-    let nd = ndims as u32;
-    // bit mask to stop the nel from being more than 24 bits
-    // will need proper validation
-    let nel = (nelems as u32) & 0x0FFF_FFFF;
-
-    ((nel << 4) | nd) as i32
+#[bitfield(u31)]
+struct Typmod {
+    #[bits(27..=30, rw)]
+    ndims: u4,
+    // TODO: Could add in a third option here to store exact dimensions... not
+    // sure how likely that is to be used though, and whether we want to pay the
+    // extra bit for that for all other tensors that don't use it.
+    #[bit(26, rw)]
+    exact_nelems: bool,
+    #[bits(0..=25, rw)]
+    rest_bits: u26,
 }
 
-// note: unpacking typmod is lossy.
-// We only have 32 bits, so we can encode the number of dimensions,
-// the data type, and the total number of elements, but not the actual
-// lengths of each dimension.
-//
-// this means different shapes with the same dim count and product
-// are indistinguishable. For example, tensor(2,3,4) and tensor(3,2,4)
-// both unpack to ndims=3 and nelems=24. That’s good enough to catch
-// obvious errors (e.g., wrong rank or element count), but not enough
-// to validate the exact shape.
-//
-// TODO : for low-rank tensors (<= 3), we could pack
-// the actual dimension lengths instead of just the product.
-// For example, in rank 2 we could dedicate 12 bits per dimension
-// (first dim in bits 0–11, second dim in bits 12–23) and still
-// have room for dtype/ndims. Beyond rank-3 this breaks down,
-// since 24 bits can’t represent enough per-dimension information
-pub fn unpack_typmod(typmod: i32) -> (u8, u32) {
-    assert!(typmod != -1, "typmod is unknown (-1)");
-    let t = typmod as u32;
+enum TypemodRest {
+    ExactNElems(TypmodRestExactNElems),
+    FullHash(u26),
+}
 
-    let nd = (t & 0xF) as u8;
-    let nel = (t >> 4) & 0x0FFF_FFFF;
+#[bitfield(u26)]
+struct TypmodRestExactNElems {
+    #[bits(10..=25, rw)]
+    nelems: u16,
+    #[bits(0..=9, rw)]
+    hash: u10,
+}
 
-    (nd, nel)
+impl Typmod {
+    fn rest(&self) -> TypemodRest {
+        if self.exact_nelems() {
+            TypemodRest::ExactNElems(TypmodRestExactNElems::new_with_raw_value(self.rest_bits()))
+        } else {
+            TypemodRest::FullHash(self.rest_bits())
+        }
+    }
+
+    // Convert a typmod into its raw encoded form.
+    fn pack(&self) -> i32 {
+        self.raw_value().as_i32()
+    }
+
+    // Try to convert the raw typmod value into a structured Typmod value.
+    fn try_unpack(raw: i32) -> Option<Typmod> {
+        let raw = u32::try_from(raw).ok()?;
+        Some(Typmod::new_with_raw_value(u31::new(raw)))
+    }
+
+    fn unpack_unchecked(raw: i32) -> Typmod {
+        Typmod::try_unpack(raw).expect("expected a non-empty raw typmod")
+    }
+
+    fn validate(&self, tensor: &Tensor) {
+        if tensor.ndims != self.ndims().value() {
+            pgrx::error!(
+                "ndims mismatch, expected {}, found {}",
+                self.ndims(),
+                tensor.ndims
+            );
+        }
+
+        let mut hasher = DefaultHasher::new();
+        tensor.dims.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        match self.rest() {
+            TypemodRest::ExactNElems(rest) => {
+                if tensor.nelems != rest.nelems().value() as u32 {
+                    pgrx::error!(
+                        "nelems mismatch, expected {}, found {}",
+                        rest.nelems(),
+                        tensor.nelems
+                    );
+                }
+
+                let actual_hash = u10::extract_u64(hash, 0);
+                if actual_hash != rest.hash() {
+                    pgrx::error!(
+                        "dimension hash mismatch, potentially incorrect dimensions, expected {:#x}, found {:#x}",
+                        rest.hash(),
+                        actual_hash
+                    );
+                }
+            }
+            TypemodRest::FullHash(expected_hash) => {
+                let actual_hash = u26::extract_u64(hash, 0);
+                if actual_hash != expected_hash {
+                    pgrx::error!(
+                        "dimension hash mismatch, potentially incorrect nelems or dimensions, expected {:#x}, found {:#x}",
+                        expected_hash,
+                        actual_hash
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl ToString for Typmod {
+    fn to_string(&self) -> String {
+        match self.rest() {
+            TypemodRest::ExactNElems(rest) => {
+                format!("ndims={} nelems={}", self.ndims(), rest.nelems())
+            }
+            TypemodRest::FullHash(_) => format!("ndims={}", self.ndims()),
+        }
+    }
 }
 
 // tells pgrx how to map the Rust Tensor type to SQL in the generated SQL
@@ -166,27 +226,12 @@ unsafe impl BoxRet for Tensor {
 // basically parse the JSON styled nested lists into our Tensor type
 // Look at the
 #[pg_extern(immutable, strict, parallel_safe, requires = ["shell_type"])]
-fn tensor_input(input: &CStr, _oid: pg_sys::Oid, type_modifier: i32) -> Tensor {
+fn tensor_input(input: &CStr, _oid: pg_sys::Oid, raw_typmod: i32) -> Tensor {
     let s = input.to_str().expect("tensor input must be valid UTF-8");
     let tensor = Tensor::from_str(s).unwrap_or_else(|e| pgrx::error!("{}", e));
 
-    if type_modifier != -1 {
-        let (expected_ndims, expected_nelems) = unpack_typmod(type_modifier);
-        if tensor.nelems != expected_nelems {
-            pgrx::error!(
-                "nelems mismatch, expected {}, found {}",
-                expected_nelems,
-                tensor.nelems
-            );
-        }
-
-        if tensor.ndims != expected_ndims {
-            pgrx::error!(
-                "ndims mismatch, expected {}, found {}",
-                expected_ndims,
-                tensor.ndims
-            );
-        }
+    if let Some(typmod) = Typmod::try_unpack(raw_typmod) {
+        typmod.validate(&tensor);
     }
 
     tensor
@@ -216,35 +261,60 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
         pgrx::error!("tensor(...) requires at least one dimension");
     }
 
-    let dims: Vec<i32> = parts
+    let dims: Vec<u32> = parts
         .iter()
         .map(|&s| {
-            s.parse::<i32>().unwrap_or_else(|_| {
+            s.parse::<u32>().unwrap_or_else(|_| {
                 pgrx::error!(r#"invalid dimension "{s}" (must be a 32-bit integer)"#)
             })
         })
         .collect();
 
-    if dims.iter().any(|&d| d < 0) {
-        pgrx::error!("dimensions must be non-negative");
-    }
+    let ndims = u8::try_from(dims.len())
+        .ok()
+        .and_then(|ndims| u4::try_new(ndims).ok())
+        .unwrap_or_else(|| pgrx::error!("too many dimensions (max 15)"));
 
-    let ndims =
-        u8::try_from(dims.len()).unwrap_or_else(|_| pgrx::error!("too many dimensions (max 15)"));
-    if ndims > 0x0F {
-        pgrx::error!("too many dimensions (max 15)");
-    }
+    let builder = Typmod::builder().with_ndims(ndims);
 
-    pack_typmod(ndims, &dims)
+    let mut hasher = DefaultHasher::new();
+    dims.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let Some(nelems) = dims.iter().fold(Some(1_u16), |acc, dim| {
+        acc.and_then(|acc| acc.checked_mul(u16::try_from(*dim).ok()?))
+    }) else {
+        return builder
+            .with_exact_nelems(false)
+            .with_rest_bits(u26::extract_u64(hash, 0))
+            .build()
+            .raw_value()
+            .value()
+            .cast_signed();
+    };
+
+    builder
+        .with_exact_nelems(true)
+        .with_rest_bits(
+            TypmodRestExactNElems::builder()
+                .with_nelems(nelems)
+                .with_hash(u10::extract_u64(hash, 0))
+                .build()
+                .raw_value(),
+        )
+        .build()
+        .raw_value()
+        .value()
+        .cast_signed()
 }
 
 // used to display the type mod
 // like in \d or pg_dump. we take the packed i32 typmod, unpack it,
 // and format it back into a human-readable string
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
-fn tensor_modifier_output(type_modifier: i32) -> CString {
-    let (ndims, nelems) = unpack_typmod(type_modifier);
-    CString::new(format!("(ndims={} nelems={})", ndims, nelems)).expect("no NUL in the middle")
+fn tensor_modifier_output(raw_typmod: i32) -> CString {
+    let typmod_string = Typmod::unpack_unchecked(raw_typmod).to_string();
+    CString::new(format!("({typmod_string})")).expect("no NUL bytes")
 }
 
 // cast a tensor to a tensor, the conversion is meaningless but we need it to
@@ -258,25 +328,8 @@ fn tensor_modifier_output(type_modifier: i32) -> CString {
 // column with a declared typmod, Postgres applies this self-cast (tensor->tensor).
 // That’s our chance to validate shape/rank/etc, then return the value unchanged if it's good
 #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
-fn cast_tensor_to_tensor(tensor: Tensor, type_modifier: i32, _explicit: bool) -> Tensor {
-    let (expected_ndims, expected_nelems) = unpack_typmod(type_modifier);
-
-    if tensor.nelems != expected_nelems {
-        pgrx::error!(
-            "nelems mismatch, expected {}, found {}",
-            expected_nelems,
-            tensor.nelems
-        );
-    }
-
-    if tensor.ndims != expected_ndims {
-        pgrx::error!(
-            "ndims mismatch, expected {}, found {}",
-            expected_ndims,
-            tensor.ndims
-        );
-    }
-
+fn cast_tensor_to_tensor(tensor: Tensor, raw_typmod: i32, _explicit: bool) -> Tensor {
+    Typmod::unpack_unchecked(raw_typmod).validate(&tensor);
     tensor
 }
 
