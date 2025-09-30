@@ -322,7 +322,7 @@ impl SharedState {
 }
 
 // global LWLock and the shared memory containing the SharedState that it protects)
-const LW_NAME: &CStr = c"tensor_bg";
+const LW_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"tensor_bg\0") };
 #[allow(non_upper_case_globals)]
 static SHMEM: PgLwLock<SharedState> = unsafe { PgLwLock::new(LW_NAME) };
 
@@ -661,7 +661,7 @@ pub extern "C-unwind" fn inference_worker_main(_arg: pg_sys::Datum) {
             };
 
             // run inference
-            let out_tensor = match session.infer(t) {
+            let out_tensor = match session.infer(&t) {
                 Ok(o) => o,
                 Err(e) => {
                     log!("inference_worker[{}] infer error: {}", model_name, e);
