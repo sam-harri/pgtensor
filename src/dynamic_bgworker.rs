@@ -661,7 +661,7 @@ pub extern "C-unwind" fn inference_worker_main(_arg: pg_sys::Datum) {
             };
 
             // run inference
-            let out_tensor = match session.infer(t) {
+            let out_tensor = match session.infer(&t) {
                 Ok(o) => o,
                 Err(e) => {
                     log!("inference_worker[{}] infer error: {}", model_name, e);

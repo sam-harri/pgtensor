@@ -139,20 +139,10 @@ impl InferenceSession {
         })
     }
 
-    pub fn infer(&mut self, t: Tensor) -> Result<Tensor, InferenceError> {
-        // Pre-check input shape vs buffer length for clearer errors
+    pub fn infer(&mut self, t: &Tensor) -> Result<Tensor, InferenceError> {
         let dims_usize: Vec<usize> = t.dims.iter().map(|&d| d as usize).collect();
-        let expected_len = dims_usize.iter().copied().fold(1usize, |acc, d| acc.saturating_mul(d));
-        let actual_len = t.elem_buffer.len();
-        if expected_len != actual_len {
-            return Err(InferenceError::InputDataLenMismatch {
-                dims: dims_usize.clone(),
-                expected: expected_len,
-                actual: actual_len,
-            });
-        }
 
-        let input = ort::value::Tensor::<f64>::from_array((dims_usize, t.elem_buffer))
+        let input = ort::value::Tensor::<f64>::from_array((dims_usize, t.elem_buffer.clone()))
             .map_err(InferenceError::Ort)?;
 
         let mut outputs = self
@@ -171,60 +161,16 @@ impl InferenceSession {
         let out_t: ort::value::Tensor<f64> = dyn_val
             .downcast()
             .map_err(|_| InferenceError::OutputTypeMismatch)?;
-        let (shape, data_f64) = out_t.extract_tensor(); // shape: Vec<i64>, data: Vec<f64>
+        let (shape, out_buffer) = out_t.extract_tensor();
 
-        // Validate/convert dims
+
         let mut out_dims: Vec<u32> = Vec::with_capacity(shape.len());
         for (axis, &d) in shape.iter().enumerate() {
-            if d < 0 {
-                return Err(InferenceError::NegativeOutputDim { axis, value: d });
-            }
-            let du = d as u64;
-            if du > u32::MAX as u64 {
-                return Err(InferenceError::OutputDimOverflow { axis, value: d });
-            }
-            out_dims.push(du as u32);
+            out_dims.push(d as u32);
         }
 
-        // Compute strides with checked math
-        let mut strides = vec![0u32; out_dims.len()];
-        let mut acc: u64 = 1;
-        for i in (0..out_dims.len()).rev() {
-            strides[i] = u32::try_from(acc).map_err(|_| InferenceError::StrideOverflow {
-                dims: out_dims.clone(),
-            })?;
-            acc = acc
-                .checked_mul(out_dims[i] as u64)
-                .ok_or_else(|| InferenceError::StrideOverflow {
-                    dims: out_dims.clone(),
-                })?;
-        }
-
-        let nelems_u64 = out_dims
-            .iter()
-            .try_fold(1u64, |p, &d| p.checked_mul(d as u64))
-            .ok_or_else(|| InferenceError::ElemCountOverflow {
-                dims: out_dims.clone(),
-            })?;
-        let nelems = u32::try_from(nelems_u64).map_err(|_| InferenceError::ElemCountOverflow {
-            dims: out_dims.clone(),
-        })?;
-
-        if data_f64.len() != nelems as usize {
-            return Err(InferenceError::OutputLenMismatch {
-                expected: nelems as usize,
-                actual: data_f64.len(),
-            });
-        }
-
-        Ok(Tensor {
-            ndims: out_dims.len() as u8,
-            flags: 0,
-            nelems,
-            dims: out_dims,
-            strides,
-            elem_buffer: data_f64.into(),
-        })
+        let t = Tensor::from_dims_and_vec(out_dims, out_buffer.into()).unwrap();
+        Ok(t)
     }
 }
 
@@ -235,10 +181,10 @@ mod tests {
 
     #[test]
     fn test_sigmoid_constant_input_runs() -> Result<(), Box<dyn std::error::Error>> {
-        let t = T::ones(vec![3, 4, 5])?;
+        let mut t = T::ones(vec![3, 4, 5])?;
 
         let mut sess = InferenceSession::new("models/sigmoid.onnx", "x", "y")?;
-        let out = sess.infer(t.clone()).expect("inference should succeed");
+        let out = sess.infer(&mut t).expect("inference should succeed");
 
         assert_eq!(out.dims, vec![3, 4, 5]);
         assert_eq!(out.nelems, 60);

@@ -28,7 +28,8 @@ pub struct Tensor {
 }
 
 impl Tensor {
-    pub fn from_dims_and_vec(dims: Vec<u32>, buffer: Vec<f64>) -> Result<Tensor, TensorError>{
+    pub fn from_dims_and_vec(dims: impl Into<Vec<u32>>, buffer: Vec<f64>) -> Result<Tensor, TensorError>{
+        let dims: Vec<u32> = dims.into();
         let nelems = dims.iter().product();
         let ndims = dims.len() as u8;
         let strides = Tensor::strides_from_dims(&dims);
@@ -72,28 +73,20 @@ impl Tensor {
         })
     }
 
-    pub fn ones(dims: Vec<u32>) -> Result<Tensor, TensorError> {
-        let ndims = dims.len();
+    pub fn ones(dims: impl Into<Vec<u32>>) -> Result<Tensor, TensorError> {
+        let dims = dims.into();
         let nelems: u32 = dims.iter().product();
-        let flags = 0;
-        let mut strides = vec![0u32; dims.len()];
-        let mut acc: u128 = 1;
-        for i in (0..dims.len()).rev() {
-            strides[i] = u32::try_from(acc).map_err(|_| TensorError::Overflow)?;
-            acc = acc
-                .checked_mul(dims[i] as u128)
-                .ok_or(TensorError::Overflow)?;
-        }
-        let elem_buffer = vec![1.0; nelems as usize];
+        let buffer = vec![1.0; nelems as usize];
 
-        Ok(Tensor {
-            ndims: ndims as u8,
-            flags,
-            nelems,
-            dims,
-            strides,
-            elem_buffer,
-        })
+        Tensor::from_dims_and_vec(dims, buffer)
+    }
+
+    pub fn zeros(dims: impl Into<Vec<u32>>) -> Result<Tensor, TensorError> {
+        let dims = dims.into();
+        let nelems: u32 = dims.iter().product();
+        let buffer = vec![1.0; nelems as usize];
+
+        Tensor::from_dims_and_vec(dims, buffer)
     }
 
     fn strides_from_dims(dims: &[u32]) -> Vec<u32> {
