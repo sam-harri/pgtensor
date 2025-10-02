@@ -26,24 +26,62 @@ pub struct Tensor {
 }
 
 impl Tensor {
+    fn to_elem_buffer_idx(&self, idxs: &[u32]) -> usize {
+        idxs.iter()
+            .zip(self.strides.iter())
+            .map(|(&i, &s)| i as usize * s as usize)
+            .sum()
+    }
+
+    fn of_elem_buffer_idx(&self, mut i: usize) -> Vec<u32> {
+        let mut res = vec![0_u32; self.ndims as usize];
+        let mut sorted_strides = self
+            .dims
+            .iter()
+            .zip(self.strides.iter())
+            .enumerate()
+            .collect::<Vec<_>>();
+        sorted_strides.sort_by_key(|(_, (_, &s))| s);
+        for (j, (&d, &s)) in sorted_strides.iter().rev() {
+            res[*j] = (i / s as usize) as u32;
+            i %= s as usize;
+        }
+        res
+    }
+
     pub fn elemwise_add(t1: &Tensor, t2: &Tensor) -> Result<Tensor, TensorError> {
-        if t1.ndims != t2.ndims || t1.dims != t2.dims {
+        if t1.dims != t2.dims {
             return Err(TensorError::ShapeMismatch);
         }
 
-        let out_vec: Vec<f64> = t1
-            .elem_buffer
-            .iter()
-            .zip(t2.elem_buffer.iter())
-            .map(|(a, b)| {
+        // TODO: Should we really be erroring if a value becomes infinite?
+        let out_vec: Vec<f64> = if t1.strides == t2.strides {
+            // Fast path
+            t1.elem_buffer
+                .iter()
+                .zip(t2.elem_buffer.iter())
+                .map(|(a, b)| {
+                    let result = a + b;
+                    if result.is_finite() {
+                        Ok(result)
+                    } else {
+                        Err(TensorError::Overflow)
+                    }
+                })
+                .collect::<Result<Vec<f64>, TensorError>>()?
+        } else {
+            // Slow path
+            let mut res = Vec::with_capacity(t1.nelems as usize);
+            for (i, a) in t1.elem_buffer.iter().enumerate() {
+                let b = t2[&t1.of_elem_buffer_idx(i)];
                 let result = a + b;
-                if result.is_finite() {
-                    Ok(result)
-                } else {
-                    Err(TensorError::Overflow)
+                if !result.is_finite() {
+                    return Err(TensorError::Overflow);
                 }
-            })
-            .collect::<Result<Vec<f64>, TensorError>>()?;
+                res.push(result);
+            }
+            res
+        };
 
         Ok(Tensor {
             ndims: t1.ndims,
@@ -77,6 +115,14 @@ impl Tensor {
             strides,
             elem_buffer,
         })
+    }
+}
+
+impl std::ops::Index<&[u32]> for Tensor {
+    type Output = f64;
+
+    fn index(&self, index: &[u32]) -> &Self::Output {
+        &self.elem_buffer[self.to_elem_buffer_idx(index)]
     }
 }
 
@@ -179,16 +225,13 @@ impl FromStr for Tensor {
     }
 }
 
-impl From<Tensor> for String {
-    fn from(t: Tensor) -> Self {
+impl From<&Tensor> for String {
+    fn from(t: &Tensor) -> Self {
         // assumed we upheld invariants for constructed Tensors
         // i.e. rectangular with non-zero dims.
         // that way the translation is infallible
 
-        fn product(dims: &[u32]) -> usize {
-            dims.iter()
-                .fold(1usize, |acc, &d| acc.saturating_mul(d as usize))
-        }
+        // TODO: Handle non-standard strides here.
 
         fn write_recursive(out: &mut String, data: &[f64], dims: &[u32]) {
             if dims.len() == 1 {
@@ -209,7 +252,7 @@ impl From<Tensor> for String {
                 }
                 out.push(']');
             } else {
-                let chunk = product(&dims[1..]);
+                let chunk: usize = dims[1..].iter().map(|&d| d as usize).product();
                 let n = dims[0] as usize;
                 out.push('[');
                 for i in 0..n {
@@ -240,6 +283,12 @@ impl From<Tensor> for String {
     }
 }
 
+impl From<Tensor> for String {
+    fn from(value: Tensor) -> Self {
+        (&value).into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,14 +309,41 @@ mod tests {
 
     #[test]
     fn rank2() -> Result<(), Box<dyn Error>> {
-        let t = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 2);
-        assert_eq!(t.dims, vec![2, 3]);
-        assert_eq!(t.nelems, 6);
-        assert_eq!(t.strides, vec![3, 1]);
+        let t1 = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
+        assert_eq!(t1.ndims, 2);
+        assert_eq!(t1.dims, vec![2, 3]);
+        assert_eq!(t1.nelems, 6);
+        assert_eq!(t1.strides, vec![3, 1]);
+        assert_eq!(t1[&[1, 1]], 5.0);
 
-        let s: String = t.into();
+        let s: String = (&t1).into();
         assert_eq!(s, "[[1.0,2.0,3.0],[4.0,5.0,6.0]]".to_owned());
+
+        let t2 = Tensor {
+            ndims: 2,
+            flags: 0,
+            nelems: 6,
+            dims: vec![2, 3],
+            strides: vec![1, 2],
+            elem_buffer: vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
+        };
+        assert_eq!(t2[&[1, 1]], 5.0);
+
+        assert_eq!(
+            Into::<String>::into(&Tensor::elemwise_add(&t1, &t2)?),
+            "[[2.0,4.0,6.0],[8.0,10.0,12.0]]".to_owned()
+        );
+
+        // TODO: Remove 0 add once Tensor -> String conversion respects strides.
+        let t3 = "[[0,0,0],[0,0,0]]".parse::<Tensor>()?;
+        assert_eq!(
+            Into::<String>::into(&Tensor::elemwise_add(
+                &t3,
+                &Tensor::elemwise_add(&t2, &t1)?
+            )?),
+            "[[2.0,4.0,6.0],[8.0,10.0,12.0]]".to_owned()
+        );
+
         Ok(())
     }
 
@@ -293,7 +369,7 @@ mod tests {
         let b = "[[10,20,30],[40,50,60]]".parse::<Tensor>()?;
         let c = Tensor::elemwise_add(&a, &b)?;
         assert_eq!(
-            Into::<String>::into(c),
+            Into::<String>::into(&c),
             "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
         );
         Ok(())

@@ -158,10 +158,10 @@ impl FromDatum for Tensor {
         }
         let bytes: &[u8] = <&[u8]>::from_polymorphic_datum(datum, is_null, typoid)?;
 
-        match serde_cbor::from_slice::<Tensor>(bytes) {
-            Ok(t) => Some(t),
-            Err(e) => pgrx::error!("failed to deserialize Tensor from CBOR: {}", e),
-        }
+        Some(
+            serde_cbor::from_slice(bytes)
+                .unwrap_or_else(|e| pgrx::error!("failed to deserialize Tensor from CBOR: {}", e)),
+        )
     }
 }
 
@@ -170,12 +170,11 @@ impl FromDatum for Tensor {
 // the rust_regtypein is a pgrx macro that tells postgres what SQL type OID corresponds to this Rust type
 impl IntoDatum for Tensor {
     fn into_datum(self) -> Option<pg_sys::Datum> {
-        let v = match serde_cbor::to_vec(&self) {
-            Ok(v) => v,
-            Err(e) => pgrx::error!("failed to serialize Tensor to CBOR: {}", e),
-        };
-        v.into_datum()
+        serde_cbor::to_vec(&self)
+            .unwrap_or_else(|e| pgrx::error!("failed to serialize Tensor to CBOR: {}", e))
+            .into_datum()
     }
+
     fn type_oid() -> pg_sys::Oid {
         rust_regtypein::<Self>()
     }
@@ -243,7 +242,7 @@ fn tensor_input(input: &CStr, _oid: pg_sys::Oid, raw_typmod: i32) -> Tensor {
 // our literal format and hand it to Postgres as a CString.
 #[pg_extern(immutable, strict, parallel_safe, requires = [ "shell_type" ])]
 fn tensor_output(tensor: Tensor) -> CString {
-    let string_repr: String = tensor.into();
+    let string_repr: String = (&tensor).into();
     CString::new(string_repr).expect("there should be no NUL in the middle")
 }
 
@@ -373,7 +372,5 @@ extension_sql!(
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
 pub fn elemwise_add(t1: Tensor, t2: Tensor) -> Tensor {
-    Tensor::elemwise_add(&t1, &t2)
-        .map_err(|err| pgrx::error!("{}", err))
-        .unwrap()
+    Tensor::elemwise_add(&t1, &t2).unwrap_or_else(|e| pgrx::error!("{}", e))
 }
