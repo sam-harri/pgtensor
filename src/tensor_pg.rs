@@ -68,11 +68,11 @@ impl Typmod {
     }
 
     fn validate(&self, tensor: &Tensor) {
-        if tensor.ndims != self.ndims().value() {
+        if tensor.dims.len() != self.ndims().value() as usize {
             pgrx::error!(
                 "ndims mismatch, expected {}, found {}",
                 self.ndims(),
-                tensor.ndims
+                tensor.dims.len()
             );
         }
 

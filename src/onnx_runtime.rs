@@ -98,7 +98,6 @@ impl InferenceSession {
         let nelems = u32::try_from(nelems_u64).map_err(|_| InferenceError::InferenceFailed)?;
 
         Ok(Tensor {
-            ndims: out_dims.len() as u8,
             flags: 0,
             dims: out_dims,
             strides,
@@ -120,7 +119,6 @@ mod tests {
         let out = sess.infer(t.clone()).expect("inference should succeed");
 
         assert_eq!(out.dims, vec![3, 4, 5]);
-        assert_eq!(out.ndims, 3);
         assert_eq!(out.strides, vec![20, 5, 1], "unexpected strides");
 
         let expected = 0.731_058_578_630_0049_f64;

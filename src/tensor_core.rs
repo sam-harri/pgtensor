@@ -17,7 +17,6 @@ pub enum TensorError {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Tensor {
-    pub ndims: u8,
     pub flags: u8, // not sure what flags we will be adding tbh
     pub dims: Vec<u32>,
     pub strides: Vec<u32>,
@@ -26,7 +25,7 @@ pub struct Tensor {
 
 impl Tensor {
     pub fn elemwise_add(t1: &Tensor, t2: &Tensor) -> Result<Tensor, TensorError> {
-        if t1.ndims != t2.ndims || t1.dims != t2.dims {
+        if t1.dims != t2.dims {
             return Err(TensorError::ShapeMismatch);
         }
 
@@ -45,7 +44,6 @@ impl Tensor {
             .collect::<Result<Vec<f64>, TensorError>>()?;
 
         Ok(Tensor {
-            ndims: t1.ndims,
             flags: 0,
             dims: t1.dims.clone(),
             strides: t1.strides.clone(),
@@ -68,7 +66,6 @@ impl Tensor {
         let elem_buffer = vec![1.0; nelems as usize];
 
         Ok(Tensor {
-            ndims: ndims as u8,
             flags,
             dims,
             strides,
@@ -166,7 +163,6 @@ impl FromStr for Tensor {
         }
 
         Ok(Tensor {
-            ndims: dims.len() as u8,
             flags: 0,
             dims,
             strides,
@@ -238,7 +234,6 @@ mod tests {
     #[test]
     fn rank1_float64_mixed_literals() -> Result<(), Box<dyn Error>> {
         let t = "[1, 2.0, 3.5, 4]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 1);
         assert_eq!(t.dims, vec![4]);
         assert_eq!(t.strides, vec![1]);
 
@@ -250,7 +245,6 @@ mod tests {
     #[test]
     fn rank2() -> Result<(), Box<dyn Error>> {
         let t = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 2);
         assert_eq!(t.dims, vec![2, 3]);
         assert_eq!(t.strides, vec![3, 1]);
 
@@ -262,7 +256,6 @@ mod tests {
     #[test]
     fn rank3() -> Result<(), Box<dyn Error>> {
         let t = "[[[1,2],[3,4]],[[5,6],[7,8]]]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 3);
         assert_eq!(t.dims, vec![2, 2, 2]);
         assert_eq!(t.strides, vec![4, 2, 1]);
 
