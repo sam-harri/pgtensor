@@ -17,7 +17,6 @@ pub enum TensorError {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Tensor {
-    pub flags: u8, // not sure what flags we will be adding tbh
     pub dims: Vec<u32>,
     pub strides: Vec<u32>,
     pub elem_buffer: Vec<f64>,
@@ -44,7 +43,6 @@ impl Tensor {
             .collect::<Result<Vec<f64>, TensorError>>()?;
 
         Ok(Tensor {
-            flags: 0,
             dims: t1.dims.clone(),
             strides: t1.strides.clone(),
             elem_buffer: out_vec,
@@ -66,7 +64,6 @@ impl Tensor {
         let elem_buffer = vec![1.0; nelems as usize];
 
         Ok(Tensor {
-            flags,
             dims,
             strides,
             elem_buffer,
@@ -163,7 +160,6 @@ impl FromStr for Tensor {
         }
 
         Ok(Tensor {
-            flags: 0,
             dims,
             strides,
             elem_buffer,

@@ -98,7 +98,6 @@ impl InferenceSession {
         let nelems = u32::try_from(nelems_u64).map_err(|_| InferenceError::InferenceFailed)?;
 
         Ok(Tensor {
-            flags: 0,
             dims: out_dims,
             strides,
             elem_buffer: data_f64.into(),
