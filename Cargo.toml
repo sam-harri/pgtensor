@@ -25,11 +25,14 @@ pgrx = "=0.16.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_cbor = "0.11.2"
-serde_json = {version = "1.0" }
+serde_json = { version = "1.0" }
 thiserror = "2.0.16"
-ort = "=2.0.0-rc.10"
+ort = { version = "=2.0.0-rc.10", features = ["half"] }
 bitbybit = "1.4.0"
 arbitrary-int = "2.0.0"
+num-traits = "0.2.19"
+paste = "1.0.15"
+half = { version = "2.7.1", features = ["num-traits", "serde"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.16.0"

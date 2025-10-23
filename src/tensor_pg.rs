@@ -4,6 +4,7 @@ use arbitrary_int::traits::Integer;
 use arbitrary_int::{u10, u26, u31, u4, TryNewError};
 use bitbybit::bitfield;
 use core::ffi::CStr;
+use paste::paste;
 use pgrx::callconv::{ArgAbi, BoxRet};
 use pgrx::datum::{FromDatum, IntoDatum, JsonB};
 use pgrx::pg_sys::AsPgCStr;
@@ -82,11 +83,11 @@ impl Typmod {
 
         match self.rest() {
             TypemodRest::ExactNElems(rest) => {
-                if tensor.elem_buffer.len() != rest.nelems().value() as usize {
+                if tensor.len() != rest.nelems().value() as usize {
                     pgrx::error!(
                         "nelems mismatch, expected {}, found {}",
                         rest.nelems(),
-                        tensor.elem_buffer.len()
+                        tensor.len()
                     );
                 }
 
@@ -174,6 +175,8 @@ impl IntoDatum for Tensor {
             Ok(v) => v,
             Err(e) => pgrx::error!("failed to serialize Tensor to CBOR: {}", e),
         };
+        // TODO: This allocates one more time than necessary, can we avoid this
+        // or does CBOR not know how much data its writing until it does it?
         v.into_datum()
     }
     fn type_oid() -> pg_sys::Oid {
@@ -341,6 +344,11 @@ CREATE TYPE vector; -- shell type
     bootstrap // declare this extension_sql block as the "bootstrap" block so that it happens first in sql generation
 );
 
+// TODO: We should define a binary representation and receive/send functions for
+// use cases where the lifetime of a tensor does not happen entirely within the
+// database.
+
+// TODO: Can we implement subscripting?
 extension_sql!(
     r#"
 CREATE TYPE tensor (
@@ -371,9 +379,22 @@ extension_sql!(
     requires = ["concrete_type", cast_tensor_to_tensor]
 );
 
-#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
-pub fn elemwise_add(t1: Tensor, t2: Tensor) -> Tensor {
-    Tensor::elemwise_add(&t1, &t2)
-        .map_err(|err| pgrx::error!("{}", err))
-        .unwrap()
+macro_rules! tensor_elemwise_extern {
+    ($i:ident) => {
+        paste! {
+            #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+            pub fn [<elemwise_ $i>](t1: Tensor, t2: Tensor) -> Tensor {
+                Tensor::[<elemwise_ $i>](&t1, &t2)
+                    .map_err(|err| pgrx::error!("{}", err))
+                    .unwrap()
+            }
+        }
+    };
 }
+
+// TODO: Declare inline operators for these.
+
+tensor_elemwise_extern!(add);
+tensor_elemwise_extern!(sub);
+tensor_elemwise_extern!(mul);
+tensor_elemwise_extern!(div);
