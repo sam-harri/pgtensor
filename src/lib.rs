@@ -97,7 +97,6 @@ mod tests {
 
         assert_eq!(out.dims, vec![3, 4, 5]);
         assert_eq!(out.ndims, 3);
-        assert_eq!(out.nelems, 60);
         assert_eq!(out.strides, vec![20, 5, 1]);
 
         // value check, sigmoid(1) ~= 0.7310585786300049

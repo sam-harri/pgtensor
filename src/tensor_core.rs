@@ -19,7 +19,6 @@ pub enum TensorError {
 pub struct Tensor {
     pub ndims: u8,
     pub flags: u8, // not sure what flags we will be adding tbh
-    pub nelems: u32,
     pub dims: Vec<u32>,
     pub strides: Vec<u32>,
     pub elem_buffer: Vec<f64>,
@@ -48,7 +47,6 @@ impl Tensor {
         Ok(Tensor {
             ndims: t1.ndims,
             flags: 0,
-            nelems: t1.nelems,
             dims: t1.dims.clone(),
             strides: t1.strides.clone(),
             elem_buffer: out_vec,
@@ -72,7 +70,6 @@ impl Tensor {
         Ok(Tensor {
             ndims: ndims as u8,
             flags,
-            nelems,
             dims,
             strides,
             elem_buffer,
@@ -171,7 +168,6 @@ impl FromStr for Tensor {
         Ok(Tensor {
             ndims: dims.len() as u8,
             flags: 0,
-            nelems,
             dims,
             strides,
             elem_buffer,
@@ -228,12 +224,6 @@ impl From<Tensor> for String {
             !t.dims.is_empty() && !t.dims.iter().any(|&d| d == 0),
             "Tensor -> String requires non-empty, non-zero dimensions"
         );
-        assert_eq!(
-            t.nelems as usize,
-            t.elem_buffer.len(),
-            "inconsistent nelems/elem_buffer"
-        );
-
         let mut s = String::new();
         write_recursive(&mut s, &t.elem_buffer, &t.dims);
         s
@@ -250,7 +240,6 @@ mod tests {
         let t = "[1, 2.0, 3.5, 4]".parse::<Tensor>()?;
         assert_eq!(t.ndims, 1);
         assert_eq!(t.dims, vec![4]);
-        assert_eq!(t.nelems, 4);
         assert_eq!(t.strides, vec![1]);
 
         let s: String = t.into();
@@ -263,7 +252,6 @@ mod tests {
         let t = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
         assert_eq!(t.ndims, 2);
         assert_eq!(t.dims, vec![2, 3]);
-        assert_eq!(t.nelems, 6);
         assert_eq!(t.strides, vec![3, 1]);
 
         let s: String = t.into();
@@ -276,7 +264,6 @@ mod tests {
         let t = "[[[1,2],[3,4]],[[5,6],[7,8]]]".parse::<Tensor>()?;
         assert_eq!(t.ndims, 3);
         assert_eq!(t.dims, vec![2, 2, 2]);
-        assert_eq!(t.nelems, 8);
         assert_eq!(t.strides, vec![4, 2, 1]);
 
         let s: String = t.into();

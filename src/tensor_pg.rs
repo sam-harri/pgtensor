@@ -82,11 +82,11 @@ impl Typmod {
 
         match self.rest() {
             TypemodRest::ExactNElems(rest) => {
-                if tensor.nelems != rest.nelems().value() as u32 {
+                if tensor.elem_buffer.len() != rest.nelems().value() as usize {
                     pgrx::error!(
                         "nelems mismatch, expected {}, found {}",
                         rest.nelems(),
-                        tensor.nelems
+                        tensor.elem_buffer.len()
                     );
                 }
 

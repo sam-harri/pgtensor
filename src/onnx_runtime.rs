@@ -100,7 +100,6 @@ impl InferenceSession {
         Ok(Tensor {
             ndims: out_dims.len() as u8,
             flags: 0,
-            nelems,
             dims: out_dims,
             strides,
             elem_buffer: data_f64.into(),
@@ -121,7 +120,6 @@ mod tests {
         let out = sess.infer(t.clone()).expect("inference should succeed");
 
         assert_eq!(out.dims, vec![3, 4, 5]);
-        assert_eq!(out.nelems, 60);
         assert_eq!(out.ndims, 3);
         assert_eq!(out.strides, vec![20, 5, 1], "unexpected strides");
 
