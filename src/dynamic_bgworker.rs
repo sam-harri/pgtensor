@@ -1,62 +1,62 @@
+//! tensor_bg.rs — shm_mq-backed background inference workers for Postgres (pgrx)
+
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
 use pgrx::bgworkers::*;
 use pgrx::pg_sys;
+use pgrx::pg_sys::shm_mq_result::{SHM_MQ_DETACHED, SHM_MQ_SUCCESS, SHM_MQ_WOULD_BLOCK};
 use pgrx::prelude::*;
 use std::cell::UnsafeCell;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::tensor_core::Tensor;
+use crate::tensor_core::Tensor; // your existing Tensor type
+
+// ------------------------------
+// config
+// ------------------------------
 
 const MAX_WORKERS: usize = 4;
-const QUEUE_CAP: usize = 16;
-const MAX_BYTES: usize = 2048; // no big ahh tensors for the time being
 
-// Anything we put into Postgres' shared memory must be safe to bitwise copy
-// (no destructors/moves) and contain no non-'static borrowss
-// We literally write its bytes into the segment, then other processes will read them
+// shm_toc keys/magic
+const TOC_MAGIC: u64 = 0x5445_4E53; // "TENS"
+const KEY_INBOUND_MQ: u64 = 1;
+const KEY_RESPONSE_MQ: u64 = 1;
+
+// MVP: overallocate DSM by this much for TOC/header
+const DSM_HEADROOM: usize = 8 * 1024;
+
+// ------------------------------
+// shared memory traits + LWLock wrapper
+// ------------------------------
+
 pub trait PGRXSharedMemory: Copy + 'static {}
 impl<T: Copy + 'static> PGRXSharedMemory for T {}
 
-// shemem follows Postgres' request -> init 2-phase process
-// This trait enforces both steps
 pub trait PgSharedMemoryInitialization {
-    // The exact byte image we plant into shared memory on first boot
     type Value: PGRXSharedMemory;
-
-    // please budget me N bytes and a tranche of LWLocks
-    // from here on out, when you see tranche just think an array of LWLocks
-    // C API: RequestAddinShmemSpace(size) + RequestNamedLWLockTranche(name, n)
     unsafe fn on_shmem_request(&'static self);
-
-    // give me my pointer, then if I’m first, I’ll initialize it
-    // bitwise copy PGRXSharedMemory into the shmem if first
-    // C API: ShmemInitStruct(name, size, &found) + GetNamedLWLockTranche(name)
     unsafe fn on_shmem_startup(&'static self, value: Self::Value);
 }
 
-// Wrapper around postgres' LWLock (its cross process lock)
-// name is basically a key to C's ShmemInitStruct to allocate/attach the shmem block
-// and doubles up as tranche name for RequestNamedLWLockTranche/GetNamedLWLockTranche
-// so we can obtain a pointer to a named LWLock we asked Postgres to createed for us
-// Need the pointer to be in UnsafeCell since we will me mutating once when postgres gives us the pointer,
-// but from that point on it will be read only
+#[repr(C)]
+struct Shared<T> {
+    data: UnsafeCell<T>,
+    lock: *mut pg_sys::LWLock,
+}
+
 pub struct PgLwLock<T> {
     name: &'static CStr,
     inner: UnsafeCell<*mut Shared<T>>,
 }
 
-// since the T that impl's PGRXSharedMemory is guarded by the LWLock, we can safely share this between threads
-// unsafe because we need to remember to actually use the lock
 unsafe impl<T: PGRXSharedMemory> Sync for PgLwLock<T> {}
 
 impl<T> PgLwLock<T> {
     pub const unsafe fn new(name: &'static CStr) -> Self {
         Self {
             name,
-            // zero initialize the pointer, then we'll set it when we get from postgres
             inner: UnsafeCell::new(std::ptr::null_mut()),
         }
     }
@@ -65,17 +65,10 @@ impl<T> PgLwLock<T> {
     }
 }
 
-// then the logic for actually aquiriing the lock
 impl<T: PGRXSharedMemory> PgLwLock<T> {
-    // get a shared reference to T, &T
     pub fn share(&self) -> PgLwLockShareGuard<'_, T> {
         unsafe {
-            let shared = self
-                .inner
-                .get()
-                .read()
-                .as_ref()
-                .expect("PgLwLock not initialized");
+            let shared = self.inner.get().read().as_ref().expect("PgLwLock not initialized");
             pg_sys::LWLockAcquire(shared.lock, pg_sys::LWLockMode::LW_SHARED);
             PgLwLockShareGuard {
                 data: &*shared.data.get(),
@@ -83,15 +76,9 @@ impl<T: PGRXSharedMemory> PgLwLock<T> {
             }
         }
     }
-    // get exlusive access to the lock, &mut T
     pub fn exclusive(&self) -> PgLwLockExclusiveGuard<'_, T> {
         unsafe {
-            let shared = self
-                .inner
-                .get()
-                .read()
-                .as_ref()
-                .expect("PgLwLock not initialized");
+            let shared = self.inner.get().read().as_ref().expect("PgLwLock not initialized");
             pg_sys::LWLockAcquire(shared.lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
             PgLwLockExclusiveGuard {
                 data: &mut *shared.data.get(),
@@ -104,18 +91,11 @@ impl<T: PGRXSharedMemory> PgLwLock<T> {
 impl<T: PGRXSharedMemory> PgSharedMemoryInitialization for PgLwLock<T> {
     type Value = T;
 
-    // hook that runs when we request shmem
-    // tell Postgres reserve me size_of::<Shared<T>>() bytes and 1 named LWLock
     unsafe fn on_shmem_request(&'static self) {
-        // returns a pointer into the shared memory segment that we can fill the first time and reuse after
         pg_sys::RequestAddinShmemSpace(size_of::<Shared<T>>());
-        // give us 1 LWLock, we'll need to ask for more later perhaps? idk tbh cause it might be a lot of work
-        // and I dont know if tht would be the bottleneck
         pg_sys::RequestNamedLWLockTranche(self.name.as_ptr(), 1);
     }
 
-    // actually init the stuff were storing inside the shmem segment
-    // postgres runs on a reserve first, init later basis
     unsafe fn on_shmem_startup(&'static self, value: T) {
         let addin_shmem_init_lock = &raw mut (*pg_sys::MainLWLockArray.add(21)).lock;
         pg_sys::LWLockAcquire(addin_shmem_init_lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
@@ -130,55 +110,31 @@ impl<T: PGRXSharedMemory> PgSharedMemoryInitialization for PgLwLock<T> {
                 lock: &raw mut (*pg_sys::GetNamedLWLockTranche(self.name.as_ptr())).lock,
             });
         }
-        // this is where we use the UnsafeCell to actually set the pointer to the lock
         *self.inner.get() = shm;
-
         pg_sys::LWLockRelease(addin_shmem_init_lock);
     }
 }
 
-// wrapper around our shared state. Since the lock is managed by postgres, we have to use UnsafeCell
-// to allow for interior mutabililty, and we use the LWLock to gate access to it.
-// lock itself is a pointer to the only LWLock that postgres allocated for us.
-// if you look at pg_sys::RequestNamedLWLockTranche, we only ask for 1 LWLock across at workers, makes it easier for now
-#[repr(C)]
-struct Shared<T> {
-    data: UnsafeCell<T>,
-    lock: *mut pg_sys::LWLock,
-}
-
-// impl of shared/read guard
-// when this guard is active you get immutable view of the payload (SharedState)
-// references only valid as long as the guard is active
 pub struct PgLwLockShareGuard<'a, T> {
     data: &'a T,
     lock: *mut pg_sys::LWLock,
 }
-
 impl<T> Deref for PgLwLockShareGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.data
     }
 }
-
 impl<T> Drop for PgLwLockShareGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe {
-            if pg_sys::InterruptHoldoffCount > 0 {
-                pg_sys::LWLockRelease(self.lock);
-            }
-        }
+        unsafe { pg_sys::LWLockRelease(self.lock) }
     }
 }
 
-// impl for exclusive/write guard
-// unique, mutable access while the guard lives
 pub struct PgLwLockExclusiveGuard<'a, T> {
     data: &'a mut T,
     lock: *mut pg_sys::LWLock,
 }
-
 impl<T> Deref for PgLwLockExclusiveGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -192,88 +148,22 @@ impl<T> DerefMut for PgLwLockExclusiveGuard<'_, T> {
 }
 impl<T> Drop for PgLwLockExclusiveGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe {
-            if pg_sys::InterruptHoldoffCount > 0 {
-                pg_sys::LWLockRelease(self.lock);
-            }
-        }
+        unsafe { pg_sys::LWLockRelease(self.lock) }
     }
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum MsgState {
-    Empty = 0,   // slot is unused (safe to overwrite)
-    Pending = 1, // caller wrote a request into the slot; worker hasn’t produced a response yet
-    Done = 2,    // worker wrote the response; caller can read it
-                 // then when the caller reads the response, it sets it back to 0
-}
+// ------------------------------
+// control-plane structures (no ring buffer)
+// ------------------------------
 
-// The thing queue is a buffer of Msgs. These are the messages were using for IPC
-// Req and Resp contain the memory for passing the serialized tensors
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct Msg {
-    id: u64,
-    caller_pid: pg_sys::pid_t,
-    state: MsgState,
-    _pad: u8,
-    req_len: u16,
-    resp_len: u16,
-    req: [u8; MAX_BYTES],
-    resp: [u8; MAX_BYTES],
-}
-impl Msg {
-    const fn empty() -> Self {
-        Self {
-            id: 0,
-            caller_pid: 0,
-            state: MsgState::Empty,
-            _pad: 0,
-            req_len: 0,
-            resp_len: 0,
-            req: [0; MAX_BYTES],
-            resp: [0; MAX_BYTES],
-        }
-    }
-}
-
-// implementation of a ring queue for passing Msgs between the worker and calling processes
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct Ring {
-    head: u32,
-    tail: u32,
-    slots: [Msg; QUEUE_CAP],
-}
-impl Ring {
-    const fn new() -> Self {
-        const M: Msg = Msg::empty();
-        Self {
-            head: 0,
-            tail: 0,
-            slots: [M; QUEUE_CAP],
-        }
-    }
-    fn is_full(&self) -> bool {
-        (self.head - self.tail) as usize >= QUEUE_CAP
-    }
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-    fn idx(i: u32) -> usize {
-        (i as usize) % QUEUE_CAP
-    }
-}
-
-// each worker process has its own state
-// name will be for the name of the ONNX model is has loaded
-// then queue_idx is it's the location of it's msg in the queue
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct WorkerEntry {
     in_use: bool,
     pid: pg_sys::pid_t,
+    inbound_handle: pg_sys::dsm_handle, // DSM handle containing inbound shm_mq
+    _pad0: u32,
+    busy: bool, // one-sender-at-a-time gate
     queue_idx: i32,
     name: [u8; 64],
 }
@@ -282,6 +172,9 @@ impl WorkerEntry {
         Self {
             in_use: false,
             pid: 0,
+            inbound_handle: 0,
+            _pad0: 0,
+            busy: false,
             queue_idx: -1,
             name: [0; 64],
         }
@@ -293,64 +186,43 @@ impl WorkerEntry {
         self.name[n] = 0;
     }
     fn name_str(&self) -> &str {
-        let len = self
-            .name
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(self.name.len());
-        std::str::from_utf8(&self.name[..len]).unwrap_or("") // gotta add a error jawn here
+        let len = self.name.iter().position(|&c| c == 0).unwrap_or(self.name.len());
+        std::str::from_utf8(&self.name[..len]).unwrap_or("")
     }
 }
 
-// shared state that the LWLock protects
-// contains all the workes and ring used for message passing
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct SharedState {
     workers: [WorkerEntry; MAX_WORKERS],
-    queues: [Ring; MAX_WORKERS],
 }
 impl SharedState {
     const fn new() -> Self {
         const W: WorkerEntry = WorkerEntry::empty();
-        const R: Ring = Ring::new();
-        Self {
-            workers: [W; MAX_WORKERS],
-            queues: [R; MAX_WORKERS],
-        }
+        Self { workers: [W; MAX_WORKERS] }
     }
 }
 
-// global LWLock and the shared memory containing the SharedState that it protects)
 const LW_NAME: &CStr = c"tensor_bg";
 #[allow(non_upper_case_globals)]
 static SHMEM: PgLwLock<SharedState> = unsafe { PgLwLock::new(LW_NAME) };
 
-// Pre pg15, extentions could request shmem in _PG_init(), then initialize in shmem_startup_hook
-// Starting in pg15 though, a new shmem_request_hook was added and postgres required that all shared-memory
-// requests happen there (not in _PG_init() or shmem_startup_hook). Initialization
-// still happens in shmem_startup_hook though
-// really what we're doing here is building the _PG_init fn, and we do so differently based on the pg version
+// ------------------------------
+// hooks (pg13-18)
+// ------------------------------
+
 #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
 mod shmem_hooks {
     use super::*;
-    // hook to request the shmem
     static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
-    // then another hook to actually init the shmem segment
     static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
 
     #[pg_guard]
     pub extern "C-unwind" fn _PG_init() {
-        // since we are asking for shmem, we need to declare in postgres.conf
-        // shared_preload_libraries = 'pgtensor'"
-        // look in the lib.rs `postgres_conf_options()` for example
-
-        // this flag is only true while the postmaster is loading shared_preload_libraries
         if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
             pgrx::error!("tensor_bg must be loaded via shared_preload_libraries");
         }
         unsafe {
-            // then we register/chain these hooks, and let the postmaster call them when its time
             PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
             pg_sys::shmem_request_hook = Some(shmem_request);
             PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
@@ -358,13 +230,11 @@ mod shmem_hooks {
         }
     }
 
-    // when the postmaster finally calls the hook, check that the hook is registered and run it
     #[pg_guard]
     unsafe extern "C-unwind" fn shmem_request() {
         if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
             prev();
         }
-        // this is the trait fn from PgSharedMemoryInitialization
         SHMEM.on_shmem_request();
     }
 
@@ -373,7 +243,6 @@ mod shmem_hooks {
         if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
             prev();
         }
-        // Other trait fn. Here we pass in the initalization logic for the SharedState
         SHMEM.on_shmem_startup(SharedState::new());
     }
 }
@@ -381,7 +250,6 @@ mod shmem_hooks {
 #[cfg(any(feature = "pg13", feature = "pg14"))]
 mod shmem_hooks {
     use super::*;
-    // no need for a request hook since we request right in the _PG_init
     static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
 
     #[pg_guard]
@@ -389,19 +257,13 @@ mod shmem_hooks {
         if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
             pgrx::error!("tensor_bg must be loaded via shared_preload_libraries");
         }
-        // so we run the request instead of registering the hook
-        unsafe {
-            SHMEM.on_shmem_request();
-        }
-
-        // but register the hook for the shmem init
+        unsafe { SHMEM.on_shmem_request(); }
         unsafe {
             PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
             pg_sys::shmem_startup_hook = Some(shmem_startup);
         }
     }
 
-    // and same as before we check the hook and run it when its time
     #[pg_guard]
     unsafe extern "C-unwind" fn shmem_startup() {
         if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
@@ -411,13 +273,13 @@ mod shmem_hooks {
     }
 }
 
-// finally, we reexport the _PG_init for whatever cfg we're using
 pub use shmem_hooks::_PG_init;
 
-// monotic ID, use an Atomic so that we can incrment atomically across threads
+// ------------------------------
+// request id + latch helper
+// ------------------------------
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-// request ID is the worker PID XORed with the monotic ID
-// should be good enough to avoid collisions but I have zero proof of that lmao
 fn next_request_id() -> u64 {
     let base = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     (base << 16) ^ (unsafe { pg_sys::MyProcPid } as u64)
@@ -430,10 +292,44 @@ unsafe fn set_latch_for_pid(pid: pg_sys::pid_t) {
     }
 }
 
+// ------------------------------
+// model path helpers (unchanged)
+// ------------------------------
+
+fn models_base_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(s) = std::env::var("PGTENSOR_MODELS_DIR") {
+        return PathBuf::from(s);
+    }
+    PathBuf::from("/var/lib/postgresql/pgtensor_model")
+}
+fn resolve_model_path(rel: &str) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    let base = models_base_dir();
+    let p = Path::new(rel);
+    if p.is_absolute() || rel.contains("..") {
+        pgrx::error!("invalid model path: must be relative and not contain '..'");
+    }
+    base.join(p)
+}
+
+// ------------------------------
+// shm_mq helpers (header)
+// ------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RequestHeader {
+    resp_handle: pg_sys::dsm_handle,
+    req_id: u64,
+}
+
+// ------------------------------
+// SQL: load_model (create per-worker inbound DSM+MQ; start worker)
+// ------------------------------
+
 #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["cast_tensor_to_tensor"])]
 pub fn load_model(name: &str, input_var: &str, output_var: &str) -> bool {
-    // simple validations (no ':' because we split on it in worker)
-    // we only allocated 64 bytes for the name, and it has to be null terminate cause CStr
     if name.is_empty() || name.len() > 63 || name.contains(':') {
         pgrx::error!("name must be 1..63 chars and cannot contain ':'");
     }
@@ -446,8 +342,7 @@ pub fn load_model(name: &str, input_var: &str, output_var: &str) -> bool {
         pgrx::error!("model file not found: {}", model_path.display());
     }
 
-    // find the first unused index in the worker arr
-    // block for reserving a spot in the queue
+    // claim free slot
     let mut queue_idx: i32 = -1;
     {
         let mut g = SHMEM.exclusive();
@@ -461,26 +356,48 @@ pub fn load_model(name: &str, input_var: &str, output_var: &str) -> bool {
                 w.in_use = true;
                 w.pid = 0;
                 w.queue_idx = i as i32;
+                w.inbound_handle = 0;
+                w.busy = false;
                 w.set_name(name);
                 queue_idx = i as i32;
                 break;
             }
         }
-        // no space left :(
         if queue_idx < 0 {
             pgrx::error!("no free worker slots (MAX_WORKERS={})", MAX_WORKERS);
         }
     }
 
-    // start the worker, pass queue_idx:name:input:output
+    // Create inbound DSM + shm_mq; pin to keep it alive until worker attaches
+    let inbound_seg = unsafe {
+        let qsize: usize = 256 * 1024;
+        let seg = pg_sys::dsm_create((qsize + DSM_HEADROOM).next_power_of_two(), 0);
+        if seg.is_null() {
+            pgrx::error!("dsm_create failed for worker inbound mq");
+        }
+        let addr = pg_sys::dsm_segment_address(seg);
+        let segsz = pg_sys::dsm_segment_map_length(seg) as usize;
+        let toc = pg_sys::shm_toc_create(TOC_MAGIC, addr, segsz);
+        let space = pg_sys::shm_toc_allocate(toc, qsize);
+        let _mq = pg_sys::shm_mq_create(space, qsize);
+        pg_sys::shm_toc_insert(toc, KEY_INBOUND_MQ, space);
+        pg_sys::dsm_pin_segment(seg);
+        seg
+    };
+    let inbound_handle = unsafe { pg_sys::dsm_segment_handle(inbound_seg) };
+
+    // publish handle
+    {
+        let mut g = SHMEM.exclusive();
+        g.workers[queue_idx as usize].inbound_handle = inbound_handle;
+    }
+
+    // Start worker
     let mut builder = BackgroundWorkerBuilder::new("tensor_bgworker");
     let builder = builder
         .set_function("inference_worker_main")
-        .set_library("pgtensor")// not sure what env var we have access to so hardcoding for now
-        .set_extra(&format!(
-            "{}:{}:{}:{}",
-            queue_idx, name, input_var, output_var
-        ))
+        .set_library("pgtensor") // adjust if your lib name differs
+        .set_extra(&format!("{}:{}:{}:{}", queue_idx, name, input_var, output_var))
         .set_notify_pid(unsafe { pg_sys::MyProcPid })
         .enable_spi_access();
 
@@ -492,94 +409,131 @@ pub fn load_model(name: &str, input_var: &str, output_var: &str) -> bool {
                     pgrx::error!("failed to start bgworker \"{}\": {:?}", name, s);
                 })
                 .unwrap();
-            let mut g = SHMEM.exclusive();
-            g.workers[queue_idx as usize].pid = pid;
+            {
+                let mut g = SHMEM.exclusive();
+                g.workers[queue_idx as usize].pid = pid;
+            }
+            unsafe { pg_sys::dsm_detach(inbound_seg) }; // still pinned
             true
         }
         Err(_) => {
-            // no more worker processes left
-            // shouldnt happen as long as you keep the MAX_WORKERS under
-            // the postgres.conf max workers - whatever other workers you have
             let mut g = SHMEM.exclusive();
             g.workers[queue_idx as usize] = WorkerEntry::empty();
+            unsafe { pg_sys::dsm_detach(inbound_seg) };
             pgrx::error!("RegisterDynamicBackgroundWorker failed (max_worker_processes?)");
         }
     }
 }
 
-// once you have a worker created (aka when the model is loaded later)
-// you can send tensors over the shmem block
+// ------------------------------
+// SQL: run_inference (per-call response DSM + send header||body)
+// ------------------------------
+
 #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["cast_tensor_to_tensor"])]
 pub fn run_inference(name: &str, t: Tensor) -> Tensor {
-    // find worker by it's name (aka the name of the model you have loaded)
-    let (qidx, pid) = {
+    let (idx, pid, inbound_handle) = {
         let g = SHMEM.share();
         let w = g
             .workers
             .iter()
             .find(|w| w.in_use && w.name_str() == name)
             .unwrap_or_else(|| pgrx::error!("bgworker \"{}\" not found", name));
-        (w.queue_idx as usize, w.pid)
+        if w.pid <= 0 {
+            pgrx::error!("bgworker \"{}\" not running", name);
+        }
+        (w.queue_idx as usize, w.pid, w.inbound_handle)
     };
-    if pid <= 0 {
-        // tried to access worker/model that isnt loaded
-        pgrx::error!("bgworker \"{}\" not running", name);
-    }
 
-    // serialize the Tensor into CBOR
-    let req =
-        serde_cbor::to_vec(&t).unwrap_or_else(|e| pgrx::error!("CBOR serialize failed: {}", e));
-    // limiting Tensors to this size for now but we can just change MAX_BYTES
-    if req.len() > MAX_BYTES {
-        pgrx::error!(
-            "tensor too large for queue ({} > {} bytes)",
-            req.len(),
-            MAX_BYTES
-        );
-    }
-    let req_id = next_request_id();
-    // process we'll be sending the tensor back to
-    let my_pid = unsafe { pg_sys::MyProcPid as pg_sys::pid_t };
-
-    // enqueue the message
-    let slot_idx = {
+    {
         let mut g = SHMEM.exclusive();
-        let ring = &mut g.queues[qidx];
-        if ring.is_full() {
-            pgrx::error!("worker \"{}\" queue full", name);
+        let w = &mut g.workers[idx];
+        if w.busy {
+            pgrx::error!("worker \"{}\" is busy; try again", name);
         }
-        let idx = Ring::idx(ring.head);
-        let m = &mut ring.slots[idx];
-        // we create/alter the message in place which is safe because we're holding hte lock to the shmem
-        m.id = req_id;
-        m.caller_pid = my_pid;
-        m.state = MsgState::Pending;
-        m.req_len = req.len() as u16;
-        m.resp_len = 0;
-        m.req[..req.len()].copy_from_slice(&req);
-        ring.head = ring.head.wrapping_add(1);
-        idx
-    };
-
-    // wake the worker, basically tell it that it has a Msg waiting for it
-    unsafe {
-        set_latch_for_pid(pid);
+        w.busy = true;
     }
 
-    // wait for response. This will be us waiting for the inference to happen
-    loop {
-        {
-            let g = SHMEM.share();
-            let m = &g.queues[qidx].slots[slot_idx];
-            if m.id == req_id && m.state == MsgState::Done {
-                let resp = &m.resp[..m.resp_len as usize];
-                let out: Tensor = serde_cbor::from_slice(resp)
-                    .unwrap_or_else(|e| pgrx::error!("CBOR decode failed: {}", e));
-                return out;
-            }
+    // per-call response DSM + mq (we are the receiver)
+    let (resp_seg, resp_handle, resp_mqh) = unsafe {
+        let qsize: usize = 256 * 1024;
+        let seg = pg_sys::dsm_create((qsize + DSM_HEADROOM).next_power_of_two(), 0);
+        if seg.is_null() {
+            pgrx::error!("dsm_create failed for response mq");
+        }
+        let addr = pg_sys::dsm_segment_address(seg);
+        let segsz = pg_sys::dsm_segment_map_length(seg) as usize;
+        let toc = pg_sys::shm_toc_create(TOC_MAGIC, addr, segsz);
+        let space = pg_sys::shm_toc_allocate(toc, qsize);
+        let mq = pg_sys::shm_mq_create(space, qsize);
+        pg_sys::shm_mq_set_receiver(mq, pg_sys::MyProc);
+        pg_sys::shm_toc_insert(toc, KEY_RESPONSE_MQ, space);
+        let mqh = pg_sys::shm_mq_attach(mq, seg, std::ptr::null_mut());
+        pg_sys::shm_mq_wait_for_attach(mqh);
+        let handle = pg_sys::dsm_segment_handle(seg);
+        (seg, handle, mqh)
+    };
+
+    // serialize tensor
+    let body =
+        serde_cbor::to_vec(&t).unwrap_or_else(|e| pgrx::error!("CBOR serialize failed: {}", e));
+    let req_id = next_request_id();
+
+    // send [header||body], then wait for response
+    let result: Tensor;
+    unsafe {
+        let in_seg = pg_sys::dsm_attach(inbound_handle);
+        if in_seg.is_null() {
+            cleanup_busy(idx);
+            pg_sys::dsm_detach(resp_seg);
+            pgrx::error!("failed to dsm_attach inbound handle for worker");
+        }
+        let in_addr = pg_sys::dsm_segment_address(in_seg);
+        let in_toc = pg_sys::shm_toc_attach(TOC_MAGIC, in_addr);
+        let in_space = pg_sys::shm_toc_lookup(in_toc, KEY_INBOUND_MQ, false);
+        if in_space.is_null() {
+            pg_sys::dsm_detach(in_seg);
+            cleanup_busy(idx);
+            pg_sys::dsm_detach(resp_seg);
+            pgrx::error!("inbound shm_mq not found in worker DSM");
         }
 
-        unsafe {
+        let in_mq = in_space as *mut pg_sys::shm_mq;
+        pg_sys::shm_mq_set_sender(in_mq, pg_sys::MyProc);
+        let in_mqh = pg_sys::shm_mq_attach(in_mq, in_seg, std::ptr::null_mut());
+
+        // header
+        let hdr = RequestHeader { resp_handle, req_id };
+        let hdr_ptr = &hdr as *const RequestHeader as *const u8;
+        let hdr_bytes = std::slice::from_raw_parts(hdr_ptr, size_of::<RequestHeader>());
+
+        // combine header + body (MVP; could use sendv)
+        let mut buf = Vec::with_capacity(hdr_bytes.len() + body.len());
+        buf.extend_from_slice(hdr_bytes);
+        buf.extend_from_slice(&body);
+
+        let res = pg_sys::shm_mq_send(in_mqh, buf.len(), buf.as_ptr() as *const _, false, true);
+        if res != SHM_MQ_SUCCESS {
+            pg_sys::dsm_detach(in_seg);
+            cleanup_busy(idx);
+            pg_sys::dsm_detach(resp_seg);
+            pgrx::error!("shm_mq_send failed (result={})", res);
+        }
+
+        set_latch_for_pid(pid);
+
+        let mut n: pg_sys::Size = 0;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        loop {
+            let r = pg_sys::shm_mq_receive(resp_mqh, &mut n, &mut p, false);
+            if r == SHM_MQ_SUCCESS {
+                break;
+            }
+            if r == SHM_MQ_DETACHED {
+                pg_sys::dsm_detach(in_seg);
+                pg_sys::dsm_detach(resp_seg);
+                cleanup_busy(idx);
+                pgrx::error!("response queue detached");
+            }
             pg_sys::ResetLatch(pg_sys::MyLatch);
             let rc = pg_sys::WaitLatch(
                 pg_sys::MyLatch,
@@ -588,11 +542,38 @@ pub fn run_inference(name: &str, t: Tensor) -> Tensor {
                 pg_sys::PG_WAIT_EXTENSION,
             );
             if (rc & pg_sys::WL_POSTMASTER_DEATH as i32) != 0 {
+                pg_sys::dsm_detach(in_seg);
+                pg_sys::dsm_detach(resp_seg);
+                cleanup_busy(idx);
                 pgrx::error!("postmaster died");
             }
         }
+
+        let resp = std::slice::from_raw_parts(p as *const u8, n as usize);
+        result = serde_cbor::from_slice(resp)
+            .unwrap_or_else(|e| {
+                pg_sys::dsm_detach(in_seg);
+                pg_sys::dsm_detach(resp_seg);
+                cleanup_busy(idx);
+                pgrx::error!("CBOR decode failed: {}", e)
+            });
+
+        pg_sys::dsm_detach(in_seg);
+        pg_sys::dsm_detach(resp_seg);
+        cleanup_busy(idx);
     }
+
+    result
 }
+
+fn cleanup_busy(idx: usize) {
+    let mut g = SHMEM.exclusive();
+    g.workers[idx].busy = false;
+}
+
+// ------------------------------
+// BGWORKER MAIN: receive via inbound mq, run, reply via caller's response mq
+// ------------------------------
 
 #[pg_guard]
 #[unsafe(no_mangle)]
@@ -613,106 +594,137 @@ pub extern "C-unwind" fn inference_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
-    // Resolve "<models_dir>/<model_name>.onnx"
     let model_path = resolve_model_path(&format!("{}.onnx", model_name));
-    log!("inference_worker \"{}\" starting on queue {} with model {}", model_name, qidx, model_path.display());
+    log!(
+        "inference_worker \"{}\" starting on slot {} with model {}",
+        model_name,
+        qidx,
+        model_path.display()
+    );
 
-    // Build the ONNX session once per worker
     let mut session = match InferenceSession::new(&model_path, &input_var, &output_var) {
         Ok(s) => s,
         Err(e) => {
             log!("inference_worker[{}]: failed to create session: {}", model_name, e);
-            // Bail out; caller will see worker not running on next attempt.
             return;
         }
     };
 
+    // Attach to inbound mq (from SHMEM)
+    let (in_mqh, in_seg) = unsafe {
+        let g = SHMEM.share();
+        let w = g.workers[qidx];
+        drop(g);
+
+        let seg = pg_sys::dsm_attach(w.inbound_handle);
+        if seg.is_null() {
+            log!("inference_worker[{}]: dsm_attach inbound failed", model_name);
+            return;
+        }
+        let addr = pg_sys::dsm_segment_address(seg);
+        let toc = pg_sys::shm_toc_attach(TOC_MAGIC, addr);
+        let space = pg_sys::shm_toc_lookup(toc, KEY_INBOUND_MQ, false);
+        if space.is_null() {
+            log!("inference_worker[{}]: inbound mq not found", model_name);
+            pg_sys::dsm_detach(seg);
+            return;
+        }
+        let mq = space as *mut pg_sys::shm_mq;
+        pg_sys::shm_mq_set_receiver(mq, pg_sys::MyProc);
+        let mqh = pg_sys::shm_mq_attach(mq, seg, std::ptr::null_mut());
+        pg_sys::shm_mq_wait_for_attach(mqh);
+        (mqh, seg)
+    };
+
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(200))) {
-        loop {
-            // pop a pending message
-            let (have, msg) = {
-                let mut g = SHMEM.exclusive();
-                let ring = &mut g.queues[qidx];
-                if ring.is_empty() {
-                    (false, Msg::empty())
-                } else {
-                    let idx = Ring::idx(ring.tail);
-                    let m = &mut ring.slots[idx];
-                    if m.state != MsgState::Pending {
-                        (false, Msg::empty())
-                    } else {
-                        let local = *m; // copy out so we can drop lock before running ONNX
-                        ring.tail = ring.tail.wrapping_add(1);
-                        (true, local)
-                    }
+        unsafe {
+            let mut n: pg_sys::Size = 0;
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+
+            let r = pg_sys::shm_mq_receive(in_mqh, &mut n, &mut p, true);
+            if r == SHM_MQ_WOULD_BLOCK {
+                continue;
+            }
+            if r != SHM_MQ_SUCCESS {
+                if r == SHM_MQ_DETACHED {
+                    break;
                 }
-            };
-            if !have {
-                break;
+                continue;
             }
 
-            // decode tensor
-            let t: Tensor = match serde_cbor::from_slice(&msg.req[..msg.req_len as usize]) {
+            let msg = std::slice::from_raw_parts(p as *const u8, n as usize);
+            if msg.len() < size_of::<RequestHeader>() {
+                log!("inference_worker[{}]: short message", model_name);
+                continue;
+            }
+
+            // parse header
+            let mut hdr = RequestHeader {
+                resp_handle: 0,
+                req_id: 0,
+            };
+            std::ptr::copy_nonoverlapping(
+                msg.as_ptr(),
+                &mut hdr as *mut RequestHeader as *mut u8,
+                size_of::<RequestHeader>(),
+            );
+            let tensor_bytes = &msg[size_of::<RequestHeader>()..];
+
+            // attach caller's response DSM/mq
+            let resp_seg = pg_sys::dsm_attach(hdr.resp_handle);
+            if resp_seg.is_null() {
+                log!("inference_worker[{}]: dsm_attach(resp) failed", model_name);
+                continue;
+            }
+            let raddr = pg_sys::dsm_segment_address(resp_seg);
+            let rtoc = pg_sys::shm_toc_attach(TOC_MAGIC, raddr);
+            let rspace = pg_sys::shm_toc_lookup(rtoc, KEY_RESPONSE_MQ, false);
+            if rspace.is_null() {
+                log!("inference_worker[{}]: response mq missing", model_name);
+                pg_sys::dsm_detach(resp_seg);
+                continue;
+            }
+            let rmq = rspace as *mut pg_sys::shm_mq;
+            pg_sys::shm_mq_set_sender(rmq, pg_sys::MyProc);
+            let rmqh = pg_sys::shm_mq_attach(rmq, resp_seg, std::ptr::null_mut());
+            pg_sys::shm_mq_wait_for_attach(rmqh);
+
+            // run inference
+            let input: Tensor = match serde_cbor::from_slice(tensor_bytes) {
                 Ok(v) => v,
                 Err(e) => {
                     log!("inference_worker[{}] decode error: {}", model_name, e);
+                    pg_sys::dsm_detach(resp_seg);
                     continue;
                 }
             };
-
-            // run inference
-            let out_tensor = match session.infer(&t) {
+            let output = match session.infer(&input) {
                 Ok(o) => o,
                 Err(e) => {
                     log!("inference_worker[{}] infer error: {}", model_name, e);
+                    pg_sys::dsm_detach(resp_seg);
                     continue;
                 }
             };
-
-            // encode and write response back to same slot (tail-1)
-            let out = match serde_cbor::to_vec(&out_tensor) {
+            let out_bytes = match serde_cbor::to_vec(&output) {
                 Ok(v) => v,
                 Err(e) => {
                     log!("inference_worker[{}] encode error: {}", model_name, e);
+                    pg_sys::dsm_detach(resp_seg);
                     continue;
                 }
             };
 
-            {
-                let mut g = SHMEM.exclusive();
-                let ring = &mut g.queues[qidx];
-                let idx = Ring::idx(ring.tail.wrapping_sub(1));
-                let m = &mut ring.slots[idx];
-                let n = out.len().min(MAX_BYTES);
-                m.resp[..n].copy_from_slice(&out[..n]);
-                m.resp_len = n as u16;
-                m.state = MsgState::Done;
-                unsafe { set_latch_for_pid(msg.caller_pid); }
+            // send back
+            let sr =
+                pg_sys::shm_mq_send(rmqh, out_bytes.len(), out_bytes.as_ptr() as *const _, false, true);
+            if sr != SHM_MQ_SUCCESS {
+                log!("inference_worker[{}] shm_mq_send resp failed ({})", model_name, sr);
             }
+            pg_sys::dsm_detach(resp_seg);
         }
     }
 
+    unsafe { pg_sys::dsm_detach(in_seg) }
     log!("inference_worker \"{}\" shutting down", model_name);
-}
-
-
-
-// some helpers that we can probably more aptly place
-fn models_base_dir() -> std::path::PathBuf {
-    use std::path::PathBuf;
-    // Dev/tests can set this,but prod falls back to the fixed dir
-    if let Ok(s) = std::env::var("PGTENSOR_MODELS_DIR") {
-        return PathBuf::from(s);
-    }
-    PathBuf::from("/var/lib/postgresql/pgtensor_model")
-}
-
-fn resolve_model_path(rel: &str) -> std::path::PathBuf {
-    use std::path::{Path, PathBuf};
-    let base = models_base_dir();
-    let p = Path::new(rel);
-    if p.is_absolute() || rel.contains("..") {
-        pgrx::error!("invalid model path: must be relative and not contain '..'");
-    }
-    base.join(p)
 }
