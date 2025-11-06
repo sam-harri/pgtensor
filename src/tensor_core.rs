@@ -1,8 +1,12 @@
 // core tensor API, no postgres leakage (or at least as much as possible)
+use half::f16;
+use num_traits::{Float, Num, One, Zero};
+use paste::paste;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number as JNumber, Value as JValue};
 use std::convert::TryFrom;
-use std::fmt;
+use std::fmt::{self, Display};
+use std::ops::{Add, Div, Mul, Sub};
 use std::str::FromStr;
 use std::string::String;
 use thiserror::Error;
@@ -11,51 +15,141 @@ use thiserror::Error;
 pub enum TensorError {
     #[error("shape mismatch")]
     ShapeMismatch,
-    #[error("Overflow during elemwise_add")]
+    #[error("element type mismatch")]
+    TypeMismatch,
+    #[error("overflow")]
     Overflow,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum TensorElemBuffer {
+    F16(Vec<f16>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+
+macro_rules! tensor_reduce {
+    ($t:expr, |$v:ident| $b:expr) => {
+        match &$t.elem_buffer {
+            TensorElemBuffer::F16($v) => $b,
+            TensorElemBuffer::F32($v) => $b,
+            TensorElemBuffer::F64($v) => $b,
+            TensorElemBuffer::I32($v) => $b,
+            TensorElemBuffer::I64($v) => $b,
+        }
+    };
+    ($t:expr, |$v:ident: $ty:ident| $b:expr) => {
+        match $t.elem_buffer {
+            TensorElemBuffer::F16($v) => {
+                type $ty = half::f16;
+                $b
+            }
+            TensorElemBuffer::F32($v) => {
+                type $ty = f32;
+                $b
+            }
+            TensorElemBuffer::F64($v) => {
+                type $ty = f64;
+                $b
+            }
+            TensorElemBuffer::I32($v) => {
+                type $ty = i32;
+                $b
+            }
+            TensorElemBuffer::I64($v) => {
+                type $ty = i64;
+                $b
+            }
+        }
+    };
+    ($t:expr, { F($vf:ident) => $bf:expr, I($vi:ident) => $bi:expr, }) => {
+        match &$t.elem_buffer {
+            TensorElemBuffer::F16($vf) => $bf,
+            TensorElemBuffer::F32($vf) => $bf,
+            TensorElemBuffer::F64($vf) => $bf,
+            TensorElemBuffer::I32($vi) => $bi,
+            TensorElemBuffer::I64($vi) => $bi,
+        }
+    };
+}
+pub(crate) use tensor_reduce;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TensorElemType {
+    F16,
+    F32,
+    F64,
+    I32,
+    I64,
+}
+macro_rules! tensor_elemtype_to_buffer {
+    ($ty:expr, $b:expr) => {
+        match $ty {
+            TensorElemType::F16 => TensorElemBuffer::F16($b),
+            TensorElemType::F32 => TensorElemBuffer::F32($b),
+            TensorElemType::F64 => TensorElemBuffer::F64($b),
+            TensorElemType::I32 => TensorElemBuffer::I32($b),
+            TensorElemType::I64 => TensorElemBuffer::I64($b),
+        }
+    };
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Tensor {
-    pub ndims: u8,
-    pub flags: u8, // not sure what flags we will be adding tbh
-    pub nelems: u32,
     pub dims: Vec<u32>,
     pub strides: Vec<u32>,
-    pub elem_buffer: Vec<f64>,
+    pub elem_buffer: TensorElemBuffer,
+}
+
+macro_rules! tensor_elemwise_op {
+    ($i:ident, $f:expr) => {
+        paste! {
+            pub fn [<elemwise_ $i>](t1: &Tensor, t2: &Tensor) -> Result<Tensor, TensorError> {
+                if t1.dims != t2.dims {
+                    return Err(TensorError::ShapeMismatch);
+                }
+
+                let elem_buffer = match (&t1.elem_buffer, &t2.elem_buffer) {
+                    (TensorElemBuffer::F16(v1), TensorElemBuffer::F16(v2)) =>  {
+                        TensorElemBuffer::F16(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
+                    }
+                    (TensorElemBuffer::F32(v1), TensorElemBuffer::F32(v2)) =>  {
+                        TensorElemBuffer::F32(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
+                    }
+                    (TensorElemBuffer::F64(v1), TensorElemBuffer::F64(v2)) => {
+                        TensorElemBuffer::F64(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
+                    }
+                    (TensorElemBuffer::I32(v1), TensorElemBuffer::I32(v2)) =>  {
+                        TensorElemBuffer::I32(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
+                    }
+                    (TensorElemBuffer::I64(v1), TensorElemBuffer::I64(v2)) => {
+                        TensorElemBuffer::I64(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
+                    }
+                    _ => return Err(TensorError::TypeMismatch),
+                };
+
+                Ok(Tensor {
+                    elem_buffer,
+                    ..t1.clone()
+                })
+            }
+        }
+    };
 }
 
 impl Tensor {
-    pub fn elemwise_add(t1: &Tensor, t2: &Tensor) -> Result<Tensor, TensorError> {
-        if t1.ndims != t2.ndims || t1.dims != t2.dims {
-            return Err(TensorError::ShapeMismatch);
-        }
-
-        let out_vec: Vec<f64> = t1
-            .elem_buffer
-            .iter()
-            .zip(t2.elem_buffer.iter())
-            .map(|(a, b)| {
-                let result = a + b;
-                if result.is_finite() {
-                    Ok(result)
-                } else {
-                    Err(TensorError::Overflow)
-                }
-            })
-            .collect::<Result<Vec<f64>, TensorError>>()?;
-
-        Ok(Tensor {
-            ndims: t1.ndims,
-            flags: 0,
-            nelems: t1.nelems,
-            dims: t1.dims.clone(),
-            strides: t1.strides.clone(),
-            elem_buffer: out_vec,
-        })
+    pub fn len(&self) -> usize {
+        tensor_reduce!(self, |v| v.len())
     }
 
-    pub fn ones(dims: Vec<u32>) -> Result<Tensor, TensorError> {
+    tensor_elemwise_op!(add, Add::add);
+    tensor_elemwise_op!(sub, Sub::sub);
+    tensor_elemwise_op!(mul, Mul::mul);
+    tensor_elemwise_op!(div, Div::div);
+
+    pub fn ones(dims: Vec<u32>, ty: TensorElemType) -> Result<Tensor, TensorError> {
         let ndims = dims.len();
         let nelems: u32 = dims.iter().product();
         let flags = 0;
@@ -67,12 +161,10 @@ impl Tensor {
                 .checked_mul(dims[i] as u128)
                 .ok_or(TensorError::Overflow)?;
         }
-        let elem_buffer = vec![1.0; nelems as usize];
+
+        let elem_buffer = tensor_elemtype_to_buffer!(ty, vec![One::one(); nelems as usize]);
 
         Ok(Tensor {
-            ndims: ndims as u8,
-            flags,
-            nelems,
             dims,
             strides,
             elem_buffer,
@@ -80,6 +172,7 @@ impl Tensor {
     }
 }
 
+// TODO: Support parsing of non-f64 tensors.
 impl FromStr for Tensor {
     type Err = TensorError;
 
@@ -169,12 +262,9 @@ impl FromStr for Tensor {
         }
 
         Ok(Tensor {
-            ndims: dims.len() as u8,
-            flags: 0,
-            nelems,
             dims,
             strides,
-            elem_buffer,
+            elem_buffer: TensorElemBuffer::F64(elem_buffer),
         })
     }
 }
@@ -190,7 +280,11 @@ impl From<Tensor> for String {
                 .fold(1usize, |acc, &d| acc.saturating_mul(d as usize))
         }
 
-        fn write_recursive(out: &mut String, data: &[f64], dims: &[u32]) {
+        fn write_recursive<E, F>(out: &mut String, data: &[E], dims: &[u32], f: F)
+        where
+            E: Copy,
+            F: Fn(E) -> String + Copy,
+        {
             if dims.len() == 1 {
                 let n = dims[0] as usize;
                 out.push('[');
@@ -199,12 +293,7 @@ impl From<Tensor> for String {
                         out.push(',');
                     }
                     let elem = data[i];
-                    // formating elems with no frac bits as X.0 so that anything downstream alwasys treats them as floats
-                    let formatted_elem = if elem.fract() == 0.0 {
-                        format!("{:.1}", elem)
-                    } else {
-                        format!("{}", elem)
-                    };
+                    let formatted_elem = f(elem);
                     out.push_str(&formatted_elem);
                 }
                 out.push(']');
@@ -218,24 +307,40 @@ impl From<Tensor> for String {
                     }
                     let start = i * chunk;
                     let end = start + chunk;
-                    write_recursive(out, &data[start..end], &dims[1..]);
+                    write_recursive(out, &data[start..end], &dims[1..], f);
                 }
                 out.push(']');
             }
+        }
+
+        fn write_float<E>(e: E) -> String
+        where
+            E: Float + Display,
+        {
+            if e.fract() == Zero::zero() {
+                format!("{:.1}", e)
+            } else {
+                format!("{}", e)
+            }
+        }
+
+        fn write_int<E>(e: E) -> String
+        where
+            E: Num + Display,
+        {
+            format!("{}", e)
         }
 
         assert!(
             !t.dims.is_empty() && !t.dims.iter().any(|&d| d == 0),
             "Tensor -> String requires non-empty, non-zero dimensions"
         );
-        assert_eq!(
-            t.nelems as usize,
-            t.elem_buffer.len(),
-            "inconsistent nelems/elem_buffer"
-        );
 
         let mut s = String::new();
-        write_recursive(&mut s, &t.elem_buffer, &t.dims);
+        tensor_reduce!(t, {
+            F(v) => write_recursive(&mut s, &v, &t.dims, write_float),
+            I(v) => write_recursive(&mut s, &v, &t.dims, write_int),
+        });
         s
     }
 }
@@ -248,9 +353,7 @@ mod tests {
     #[test]
     fn rank1_float64_mixed_literals() -> Result<(), Box<dyn Error>> {
         let t = "[1, 2.0, 3.5, 4]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 1);
         assert_eq!(t.dims, vec![4]);
-        assert_eq!(t.nelems, 4);
         assert_eq!(t.strides, vec![1]);
 
         let s: String = t.into();
@@ -261,9 +364,7 @@ mod tests {
     #[test]
     fn rank2() -> Result<(), Box<dyn Error>> {
         let t = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 2);
         assert_eq!(t.dims, vec![2, 3]);
-        assert_eq!(t.nelems, 6);
         assert_eq!(t.strides, vec![3, 1]);
 
         let s: String = t.into();
@@ -274,9 +375,7 @@ mod tests {
     #[test]
     fn rank3() -> Result<(), Box<dyn Error>> {
         let t = "[[[1,2],[3,4]],[[5,6],[7,8]]]".parse::<Tensor>()?;
-        assert_eq!(t.ndims, 3);
         assert_eq!(t.dims, vec![2, 2, 2]);
-        assert_eq!(t.nelems, 8);
         assert_eq!(t.strides, vec![4, 2, 1]);
 
         let s: String = t.into();
@@ -300,8 +399,59 @@ mod tests {
     }
 
     #[test]
+    fn elemwise_add_f16_rank2() -> Result<(), Box<dyn Error>> {
+        let a = Tensor {
+            dims: vec![2, 3],
+            strides: vec![3, 1],
+            elem_buffer: TensorElemBuffer::F16(vec![
+                f16::from_f32_const(1.0),
+                f16::from_f32_const(2.0),
+                f16::from_f32_const(3.0),
+                f16::from_f32_const(4.0),
+                f16::from_f32_const(5.0),
+                f16::from_f32_const(6.0),
+            ]),
+        };
+        let b = Tensor {
+            dims: vec![2, 3],
+            strides: vec![3, 1],
+            elem_buffer: TensorElemBuffer::F16(vec![
+                f16::from_f32_const(10.0),
+                f16::from_f32_const(20.0),
+                f16::from_f32_const(30.0),
+                f16::from_f32_const(40.0),
+                f16::from_f32_const(50.0),
+                f16::from_f32_const(60.0),
+            ]),
+        };
+        let c = Tensor::elemwise_add(&a, &b)?;
+        assert_eq!(
+            Into::<String>::into(c),
+            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elemwise_add_i32_rank2() -> Result<(), Box<dyn Error>> {
+        let a = Tensor {
+            dims: vec![2, 3],
+            strides: vec![3, 1],
+            elem_buffer: TensorElemBuffer::I32(vec![1, 2, 3, 4, 5, 6]),
+        };
+        let b = Tensor {
+            dims: vec![2, 3],
+            strides: vec![3, 1],
+            elem_buffer: TensorElemBuffer::I32(vec![10, 20, 30, 40, 50, 60]),
+        };
+        let c = Tensor::elemwise_add(&a, &b)?;
+        assert_eq!(Into::<String>::into(c), "[[11,22,33],[44,55,66]]");
+        Ok(())
+    }
+
+    #[test]
     fn test_ones() -> Result<(), Box<dyn Error>> {
-        let t1 = Tensor::ones(vec![1, 2]);
+        let t1 = Tensor::ones(vec![1, 2], TensorElemType::F64);
         let t2 = "[[1,1]]".parse::<Tensor>()?;
         assert_eq!(t2, t2);
         Ok(())
