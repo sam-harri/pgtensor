@@ -76,6 +76,38 @@ macro_rules! tensor_reduce {
 }
 pub(crate) use tensor_reduce;
 
+macro_rules! tensor_map {
+    ($t:expr, |$v:ident| $b:expr) => {
+        match $t.elem_buffer {
+            TensorElemBuffer::F16($v) => TensorElemBuffer::F16($b),
+            TensorElemBuffer::F32($v) => TensorElemBuffer::F32($b),
+            TensorElemBuffer::F64($v) => TensorElemBuffer::F64($b),
+            TensorElemBuffer::I32($v) => TensorElemBuffer::I32($b),
+            TensorElemBuffer::I64($v) => TensorElemBuffer::I64($b),
+        }
+    };
+    ($t:expr, { F($vf:ident) => $bf:expr, I($vi:ident) => $bi:expr, }) => {
+        match $t.elem_buffer {
+            TensorElemBuffer::F16($vf) => TensorElemBuffer::F16($bf),
+            TensorElemBuffer::F32($vf) => TensorElemBuffer::F32($bf),
+            TensorElemBuffer::F64($vf) => TensorElemBuffer::F64($bf),
+            TensorElemBuffer::I32($vi) => TensorElemBuffer::I32($bi),
+            TensorElemBuffer::I64($vi) => TensorElemBuffer::I64($bi),
+        }
+    };
+    ($t1:expr, $t2:expr, |$v1:ident, $v2:ident| $b:expr) => {
+        match ($t1.elem_buffer, $t2.elem_buffer) {
+            (TensorElemBuffer::F16($v1), TensorElemBuffer::F16($v2)) => TensorElemBuffer::F16($b),
+            (TensorElemBuffer::F32($v1), TensorElemBuffer::F32($v2)) => TensorElemBuffer::F32($b),
+            (TensorElemBuffer::F64($v1), TensorElemBuffer::F64($v2)) => TensorElemBuffer::F64($b),
+            (TensorElemBuffer::I32($v1), TensorElemBuffer::I32($v2)) => TensorElemBuffer::I32($b),
+            (TensorElemBuffer::I64($v1), TensorElemBuffer::I64($v2)) => TensorElemBuffer::I64($b),
+            _ => return Err(TensorError::TypeMismatch),
+        }
+    };
+}
+pub(crate) use tensor_map;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TensorElemType {
     F16,
@@ -106,33 +138,18 @@ pub struct Tensor {
 macro_rules! tensor_elemwise_op {
     ($i:ident, $f:expr) => {
         paste! {
-            pub fn [<elemwise_ $i>](t1: &Tensor, t2: &Tensor) -> Result<Tensor, TensorError> {
+            pub fn [<elemwise_ $i>](t1: Tensor, t2: Tensor) -> Result<Tensor, TensorError> {
                 if t1.dims != t2.dims {
                     return Err(TensorError::ShapeMismatch);
                 }
 
-                let elem_buffer = match (&t1.elem_buffer, &t2.elem_buffer) {
-                    (TensorElemBuffer::F16(v1), TensorElemBuffer::F16(v2)) =>  {
-                        TensorElemBuffer::F16(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
-                    }
-                    (TensorElemBuffer::F32(v1), TensorElemBuffer::F32(v2)) =>  {
-                        TensorElemBuffer::F32(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
-                    }
-                    (TensorElemBuffer::F64(v1), TensorElemBuffer::F64(v2)) => {
-                        TensorElemBuffer::F64(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
-                    }
-                    (TensorElemBuffer::I32(v1), TensorElemBuffer::I32(v2)) =>  {
-                        TensorElemBuffer::I32(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
-                    }
-                    (TensorElemBuffer::I64(v1), TensorElemBuffer::I64(v2)) => {
-                        TensorElemBuffer::I64(v1.iter().zip(v2).map(|(&e1, &e2)| $f(e1, e2)).collect())
-                    }
-                    _ => return Err(TensorError::TypeMismatch),
-                };
+                let elem_buffer = tensor_map!(t1, t2, |v1, v2| {
+                    v1.into_iter().zip(v2).map(|(e1, e2)| $f(e1, e2)).collect()
+                });
 
                 Ok(Tensor {
                     elem_buffer,
-                    ..t1.clone()
+                    ..t1
                 })
             }
         }
@@ -167,6 +184,165 @@ impl Tensor {
         Ok(Tensor {
             dims,
             strides,
+            elem_buffer,
+        })
+    }
+
+    pub fn exp(t: Tensor) -> Result<Tensor, TensorError> {
+        let elem_buffer = tensor_map!(t, {
+            F(v) => v.into_iter().map(|e| e.exp()).collect(),
+            I(v) => return Err(TensorError::TypeMismatch),
+        });
+
+        Ok(Tensor { elem_buffer, ..t })
+    }
+
+    pub fn ln(t: Tensor) -> Result<Tensor, TensorError> {
+        let elem_buffer = tensor_map!(t, {
+            F(v) => v.into_iter().map(|e| e.ln()).collect(),
+            I(v) => return Err(TensorError::TypeMismatch),
+        });
+
+        Ok(Tensor { elem_buffer, ..t })
+    }
+
+    pub fn powf(t: Tensor, exp: f32) -> Result<Tensor, TensorError> {
+        let elem_buffer = match t.elem_buffer {
+            TensorElemBuffer::F16(v) => {
+                TensorElemBuffer::F16(v.into_iter().map(|e| e.powf(f16::from_f32(exp))).collect())
+            }
+            TensorElemBuffer::F32(v) => {
+                TensorElemBuffer::F32(v.into_iter().map(|e| e.powf(exp)).collect())
+            }
+            TensorElemBuffer::F64(v) => {
+                TensorElemBuffer::F64(v.into_iter().map(|e| e.powf(exp.into())).collect())
+            }
+            TensorElemBuffer::I32(_) | TensorElemBuffer::I64(_) => {
+                return Err(TensorError::TypeMismatch)
+            }
+        };
+
+        Ok(Tensor { elem_buffer, ..t })
+    }
+
+    pub fn powi(t: Tensor, exp: i32) -> Result<Tensor, TensorError> {
+        let elem_buffer = tensor_map!(t, {
+            F(v) =>  v.into_iter().map(|e| e.powi(exp)).collect() ,
+            I(v) => {
+                let exp: u32 = exp.try_into().map_err(|_| TensorError::Overflow)?;
+                v.into_iter().map(|e| e.pow(exp)).collect()
+            },
+        });
+
+        Ok(Tensor { elem_buffer, ..t })
+    }
+
+    pub fn dotf(t1: Tensor, t2: Tensor) -> Result<f64, TensorError> {
+        match (t1.elem_buffer, t2.elem_buffer) {
+            (TensorElemBuffer::F16(v1), TensorElemBuffer::F16(v2)) => Ok(v1
+                .into_iter()
+                .zip(v2)
+                .map(|(e1, e2)| e1.to_f64() * e2.to_f64())
+                .sum()),
+            (TensorElemBuffer::F32(v1), TensorElemBuffer::F32(v2)) => Ok(v1
+                .into_iter()
+                .zip(v2)
+                .map(|(e1, e2)| e1 as f64 * e2 as f64)
+                .sum()),
+            (TensorElemBuffer::F64(v1), TensorElemBuffer::F64(v2)) => {
+                Ok(v1.into_iter().zip(v2).map(|(e1, e2)| e1 * e2).sum())
+            }
+            _ => Err(TensorError::TypeMismatch),
+        }
+    }
+
+    pub fn doti(t1: Tensor, t2: Tensor) -> Result<i64, TensorError> {
+        match (t1.elem_buffer, t2.elem_buffer) {
+            (TensorElemBuffer::I32(v1), TensorElemBuffer::I32(v2)) => Ok(v1
+                .into_iter()
+                .zip(v2)
+                .map(|(e1, e2)| e1 as i64 * e2 as i64)
+                .sum()),
+            (TensorElemBuffer::I64(v1), TensorElemBuffer::I64(v2)) => {
+                Ok(v1.into_iter().zip(v2).map(|(e1, e2)| e1 * e2).sum())
+            }
+            _ => Err(TensorError::TypeMismatch),
+        }
+    }
+
+    pub fn matvec(m: Tensor, v: Tensor) -> Result<Tensor, TensorError> {
+        if m.dims.len() != 2 && v.dims.len() != 1 && m.dims[1] != v.dims[0] {
+            return Err(TensorError::ShapeMismatch);
+        }
+
+        let elem_buffer = tensor_map!(m, v, |mb, vb| {
+            let mut res = Vec::with_capacity(m.dims[0] as usize);
+            for y in 0..m.dims[0] as usize {
+                let mut e = Zero::zero();
+                for x in 0..m.dims[1] as usize {
+                    e += mb[m.strides[0] as usize * y + m.strides[1] as usize * x]
+                        * vb[v.strides[0] as usize * x];
+                }
+                res.push(e);
+            }
+            res
+        });
+
+        Ok(Tensor {
+            dims: vec![m.dims[0]],
+            strides: vec![1],
+            elem_buffer,
+        })
+    }
+
+    pub fn vecmat(v: Tensor, m: Tensor) -> Result<Tensor, TensorError> {
+        if v.dims.len() != 1 && m.dims.len() != 2 && v.dims[0] != m.dims[0] {
+            return Err(TensorError::ShapeMismatch);
+        }
+
+        let elem_buffer = tensor_map!(m, v, |mb, vb| {
+            let mut res = Vec::with_capacity(m.dims[1] as usize);
+            for x in 0..m.dims[1] as usize {
+                let mut e = Zero::zero();
+                for y in 0..m.dims[0] as usize {
+                    e += mb[m.strides[0] as usize * y + m.strides[1] as usize * x]
+                        * vb[v.strides[0] as usize * y];
+                }
+                res.push(e);
+            }
+            res
+        });
+
+        Ok(Tensor {
+            dims: vec![m.dims[1]],
+            strides: vec![1],
+            elem_buffer,
+        })
+    }
+
+    pub fn matmul(t1: Tensor, t2: Tensor) -> Result<Tensor, TensorError> {
+        if t1.dims.len() != 2 && t2.dims.len() != 2 && t1.dims[1] != t2.dims[0] {
+            return Err(TensorError::ShapeMismatch);
+        }
+
+        let elem_buffer = tensor_map!(t1, t2, |v1, v2| {
+            let mut res = Vec::with_capacity(t1.dims[0] as usize * t2.dims[1] as usize);
+            for x in 0..t1.dims[0] as usize {
+                for y in 0..t2.dims[1] as usize {
+                    let mut e = Zero::zero();
+                    for z in 0..t1.dims[1] as usize {
+                        e += v1[t1.strides[0] as usize * x + t1.strides[1] as usize * z]
+                            * v2[t2.strides[0] as usize * z + t2.strides[1] as usize * y];
+                    }
+                    res.push(e);
+                }
+            }
+            res
+        });
+
+        Ok(Tensor {
+            dims: vec![t1.dims[0], t2.dims[1]],
+            strides: vec![t2.dims[1], 1],
             elem_buffer,
         })
     }
@@ -460,7 +636,7 @@ mod tests {
     fn elemwise_add_f64_rank2() -> Result<(), Box<dyn Error>> {
         let a = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
         let b = "[[10,20,30],[40,50,60]]".parse::<Tensor>()?;
-        let c = Tensor::elemwise_add(&a, &b)?;
+        let c = Tensor::elemwise_add(a, b)?;
         assert_eq!(
             Into::<String>::into(c),
             "[[11.0,22.0,33.0],[44.0,55.0,66.0]]::f64"
@@ -472,7 +648,7 @@ mod tests {
     fn elemwise_add_f16_rank2() -> Result<(), Box<dyn Error>> {
         let a = "[[1,2,3],[4,5,6]]::f16".parse::<Tensor>()?;
         let b = "[[10,20,30],[40,50,60]]::f16".parse::<Tensor>()?;
-        let c = Tensor::elemwise_add(&a, &b)?;
+        let c = Tensor::elemwise_add(a, b)?;
         assert_eq!(
             Into::<String>::into(c),
             "[[11.0,22.0,33.0],[44.0,55.0,66.0]]::f16"
@@ -484,7 +660,7 @@ mod tests {
     fn elemwise_add_i32_rank2() -> Result<(), Box<dyn Error>> {
         let a = "[[1,2,3],[4,5,6]]::i32".parse::<Tensor>()?;
         let b = "[[10,20,30],[40,50,60]]::i32".parse::<Tensor>()?;
-        let c = Tensor::elemwise_add(&a, &b)?;
+        let c = Tensor::elemwise_add(a, b)?;
         assert_eq!(Into::<String>::into(c), "[[11,22,33],[44,55,66]]::i32");
         Ok(())
     }
@@ -494,6 +670,33 @@ mod tests {
         let t1 = Tensor::ones(vec![1, 2], TensorElemType::F64);
         let t2 = "[[1,1]]".parse::<Tensor>()?;
         assert_eq!(t2, t2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_matvec() -> Result<(), Box<dyn Error>> {
+        let m = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
+        let v = "[7, 8, 9]".parse::<Tensor>()?;
+        let a = Tensor::matvec(m, v)?;
+        assert_eq!(Into::<String>::into(a), "[50.0,122.0]::f64");
+        Ok(())
+    }
+
+    #[test]
+    fn test_vecmat() -> Result<(), Box<dyn Error>> {
+        let v = "[7, 8]".parse::<Tensor>()?;
+        let m = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
+        let a = Tensor::vecmat(v, m)?;
+        assert_eq!(Into::<String>::into(a), "[39.0,54.0,69.0]::f64");
+        Ok(())
+    }
+
+    #[test]
+    fn test_matmul() -> Result<(), Box<dyn Error>> {
+        let a = "[[1,2,3],[4,5,6]]".parse::<Tensor>()?;
+        let b = "[[1,2],[3,4],[5,6]]".parse::<Tensor>()?;
+        let c = Tensor::matmul(a, b)?;
+        assert_eq!(Into::<String>::into(c), "[[22.0,28.0],[49.0,64.0]]::f64");
         Ok(())
     }
 }
