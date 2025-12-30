@@ -5,7 +5,7 @@ use paste::paste;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number as JNumber, Value as JValue};
 use std::convert::TryFrom;
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Write};
 use std::ops::{Add, Div, Mul, Sub};
 use std::str::FromStr;
 use std::string::String;
@@ -172,11 +172,73 @@ impl Tensor {
     }
 }
 
-// TODO: Support parsing of non-f64 tensors.
+trait FromJNumber: Sized {
+    fn from(n: &JNumber) -> Result<Self, TensorError>;
+}
+
+impl FromJNumber for f16 {
+    fn from(n: &JNumber) -> Result<Self, TensorError> {
+        let x = f16::from_f64(n.as_f64().ok_or(TensorError::ShapeMismatch)?);
+        if !x.is_finite() {
+            return Err(TensorError::Overflow);
+        }
+        Ok(x)
+    }
+}
+
+impl FromJNumber for f32 {
+    fn from(n: &JNumber) -> Result<Self, TensorError> {
+        let x = n.as_f64().ok_or(TensorError::ShapeMismatch)? as f32;
+        if !x.is_finite() {
+            return Err(TensorError::Overflow);
+        }
+        Ok(x)
+    }
+}
+
+impl FromJNumber for f64 {
+    fn from(n: &JNumber) -> Result<Self, TensorError> {
+        let x = n.as_f64().ok_or(TensorError::ShapeMismatch)?;
+        if !x.is_finite() {
+            return Err(TensorError::Overflow);
+        }
+        Ok(x)
+    }
+}
+
+impl FromJNumber for i32 {
+    fn from(n: &JNumber) -> Result<Self, TensorError> {
+        n.as_i64()
+            .ok_or(TensorError::ShapeMismatch)?
+            .try_into()
+            .map_err(|_| TensorError::Overflow)
+    }
+}
+
+impl FromJNumber for i64 {
+    fn from(n: &JNumber) -> Result<Self, TensorError> {
+        n.as_i64().ok_or(TensorError::ShapeMismatch)
+    }
+}
+
 impl FromStr for Tensor {
     type Err = TensorError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (s, ty) = if let Some(s) = s.strip_suffix("::f16") {
+            (s, TensorElemType::F16)
+        } else if let Some(s) = s.strip_suffix("::f32") {
+            (s, TensorElemType::F32)
+        } else if let Some(s) = s.strip_suffix("::f64") {
+            (s, TensorElemType::F64)
+        } else if let Some(s) = s.strip_suffix("::i32") {
+            (s, TensorElemType::I32)
+        } else if let Some(s) = s.strip_suffix("::i64") {
+            (s, TensorElemType::I64)
+        } else {
+            (s, TensorElemType::F64)
+        };
+
         // infer dimensions recursively
         // uphold rectangularity and no empties invariants
         fn infer_dims(v: &JValue) -> Result<Vec<u32>, TensorError> {
@@ -205,7 +267,7 @@ impl FromStr for Tensor {
         }
 
         // flatten numbers as row-major
-        fn flatten(v: &JValue, out: &mut Vec<f64>) -> Result<(), TensorError> {
+        fn flatten<T: FromJNumber>(v: &JValue, out: &mut Vec<T>) -> Result<(), TensorError> {
             match v {
                 JValue::Array(a) => {
                     for elem in a {
@@ -214,11 +276,7 @@ impl FromStr for Tensor {
                     Ok(())
                 }
                 JValue::Number(n) => {
-                    let x = n.as_f64().ok_or(TensorError::ShapeMismatch)?;
-                    if !x.is_finite() {
-                        return Err(TensorError::Overflow);
-                    }
-                    out.push(x);
+                    out.push(FromJNumber::from(n)?);
                     Ok(())
                 }
                 _ => Err(TensorError::ShapeMismatch),
@@ -237,19 +295,13 @@ impl FromStr for Tensor {
             return Err(TensorError::ShapeMismatch);
         }
 
-        let mut elem_buffer = Vec::<f64>::new();
-        flatten(&v, &mut elem_buffer)?;
-
         // Count check (and protect against overflow)
         let mut prod: u128 = 1;
         for &d in &dims {
             prod = prod.checked_mul(d as u128).ok_or(TensorError::Overflow)?;
         }
-        if prod as usize != elem_buffer.len() {
-            return Err(TensorError::ShapeMismatch);
-        }
 
-        let nelems = u32::try_from(elem_buffer.len()).map_err(|_| TensorError::Overflow)?;
+        let nelems = u32::try_from(prod).map_err(|_| TensorError::Overflow)?;
 
         // Element strides in C-order (row-major).
         let mut strides = vec![0u32; dims.len()];
@@ -261,10 +313,21 @@ impl FromStr for Tensor {
                 .ok_or(TensorError::Overflow)?;
         }
 
+        let elem_buffer = tensor_elemtype_to_buffer!(ty, {
+            let mut elem_buffer = Vec::with_capacity(nelems as usize);
+            flatten(&v, &mut elem_buffer)?;
+
+            if prod as usize != elem_buffer.len() {
+                return Err(TensorError::ShapeMismatch);
+            }
+
+            elem_buffer
+        });
+
         Ok(Tensor {
             dims,
             strides,
-            elem_buffer: TensorElemBuffer::F64(elem_buffer),
+            elem_buffer,
         })
     }
 }
@@ -341,6 +404,13 @@ impl From<Tensor> for String {
             F(v) => write_recursive(&mut s, &v, &t.dims, write_float),
             I(v) => write_recursive(&mut s, &v, &t.dims, write_int),
         });
+        match t.elem_buffer {
+            TensorElemBuffer::F16(_) => s.write_str("::f16"),
+            TensorElemBuffer::F32(_) => s.write_str("::f32"),
+            TensorElemBuffer::F64(_) => s.write_str("::f64"),
+            TensorElemBuffer::I32(_) => s.write_str("::i32"),
+            TensorElemBuffer::I64(_) => s.write_str("::i64"),
+        };
         s
     }
 }
@@ -357,7 +427,7 @@ mod tests {
         assert_eq!(t.strides, vec![1]);
 
         let s: String = t.into();
-        assert_eq!(s, "[1.0,2.0,3.5,4.0]".to_owned());
+        assert_eq!(s, "[1.0,2.0,3.5,4.0]::f64".to_owned());
         Ok(())
     }
 
@@ -368,7 +438,7 @@ mod tests {
         assert_eq!(t.strides, vec![3, 1]);
 
         let s: String = t.into();
-        assert_eq!(s, "[[1.0,2.0,3.0],[4.0,5.0,6.0]]".to_owned());
+        assert_eq!(s, "[[1.0,2.0,3.0],[4.0,5.0,6.0]]::f64".to_owned());
         Ok(())
     }
 
@@ -381,7 +451,7 @@ mod tests {
         let s: String = t.into();
         assert_eq!(
             s,
-            "[[[1.0,2.0],[3.0,4.0]],[[5.0,6.0],[7.0,8.0]]]".to_owned()
+            "[[[1.0,2.0],[3.0,4.0]],[[5.0,6.0],[7.0,8.0]]]::f64".to_owned()
         );
         Ok(())
     }
@@ -393,59 +463,29 @@ mod tests {
         let c = Tensor::elemwise_add(&a, &b)?;
         assert_eq!(
             Into::<String>::into(c),
-            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
+            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]::f64"
         );
         Ok(())
     }
 
     #[test]
     fn elemwise_add_f16_rank2() -> Result<(), Box<dyn Error>> {
-        let a = Tensor {
-            dims: vec![2, 3],
-            strides: vec![3, 1],
-            elem_buffer: TensorElemBuffer::F16(vec![
-                f16::from_f32_const(1.0),
-                f16::from_f32_const(2.0),
-                f16::from_f32_const(3.0),
-                f16::from_f32_const(4.0),
-                f16::from_f32_const(5.0),
-                f16::from_f32_const(6.0),
-            ]),
-        };
-        let b = Tensor {
-            dims: vec![2, 3],
-            strides: vec![3, 1],
-            elem_buffer: TensorElemBuffer::F16(vec![
-                f16::from_f32_const(10.0),
-                f16::from_f32_const(20.0),
-                f16::from_f32_const(30.0),
-                f16::from_f32_const(40.0),
-                f16::from_f32_const(50.0),
-                f16::from_f32_const(60.0),
-            ]),
-        };
+        let a = "[[1,2,3],[4,5,6]]::f16".parse::<Tensor>()?;
+        let b = "[[10,20,30],[40,50,60]]::f16".parse::<Tensor>()?;
         let c = Tensor::elemwise_add(&a, &b)?;
         assert_eq!(
             Into::<String>::into(c),
-            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
+            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]::f16"
         );
         Ok(())
     }
 
     #[test]
     fn elemwise_add_i32_rank2() -> Result<(), Box<dyn Error>> {
-        let a = Tensor {
-            dims: vec![2, 3],
-            strides: vec![3, 1],
-            elem_buffer: TensorElemBuffer::I32(vec![1, 2, 3, 4, 5, 6]),
-        };
-        let b = Tensor {
-            dims: vec![2, 3],
-            strides: vec![3, 1],
-            elem_buffer: TensorElemBuffer::I32(vec![10, 20, 30, 40, 50, 60]),
-        };
+        let a = "[[1,2,3],[4,5,6]]::i32".parse::<Tensor>()?;
+        let b = "[[10,20,30],[40,50,60]]::i32".parse::<Tensor>()?;
         let c = Tensor::elemwise_add(&a, &b)?;
-        assert_eq!(Into::<String>::into(c), "[[11,22,33],[44,55,66]]");
+        assert_eq!(Into::<String>::into(c), "[[11,22,33],[44,55,66]]::i32");
         Ok(())
     }
 
