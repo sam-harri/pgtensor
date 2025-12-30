@@ -4,6 +4,7 @@ use arbitrary_int::traits::Integer;
 use arbitrary_int::{u10, u26, u31, u4, TryNewError};
 use bitbybit::bitfield;
 use core::ffi::CStr;
+use half::f16;
 use paste::paste;
 use pgrx::callconv::{ArgAbi, BoxRet};
 use pgrx::datum::{FromDatum, IntoDatum, JsonB};
@@ -338,17 +339,23 @@ fn cast_tensor_to_tensor(tensor: Tensor, raw_typmod: i32, _explicit: bool) -> Te
 
 extension_sql!(
     r#"
-CREATE TYPE vector; -- shell type
+CREATE TYPE tensor; -- shell type
 "#,
     name = "shell_type",
     bootstrap // declare this extension_sql block as the "bootstrap" block so that it happens first in sql generation
 );
 
-// TODO: We should define a binary representation and receive/send functions for
-// use cases where the lifetime of a tensor does not happen entirely within the
-// database.
+/*
+## Potential Future Work
 
-// TODO: Can we implement subscripting?
+We should define a binary representation and receive/send functions for use
+cases where the lifetime of a tensor does not happen entirely within the
+database.
+
+Can we implement subscripting? Doesn't look like PGRX has any direct support
+for this...
+*/
+
 extension_sql!(
     r#"
 CREATE TYPE tensor (
@@ -384,7 +391,7 @@ macro_rules! tensor_elemwise_extern {
         paste! {
             #[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
             pub fn [<elemwise_ $i>](t1: Tensor, t2: Tensor) -> Tensor {
-                Tensor::[<elemwise_ $i>](&t1, &t2)
+                Tensor::[<elemwise_ $i>](t1, t2)
                     .map_err(|err| pgrx::error!("{}", err))
                     .unwrap()
             }
@@ -392,9 +399,158 @@ macro_rules! tensor_elemwise_extern {
     };
 }
 
-// TODO: Declare inline operators for these.
-
 tensor_elemwise_extern!(add);
 tensor_elemwise_extern!(sub);
 tensor_elemwise_extern!(mul);
 tensor_elemwise_extern!(div);
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR + (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = elemwise_add,
+    COMMUTATOR = +
+    );
+    "#,
+    name = "elemwise_add_operator",
+    requires = ["concrete_type", elemwise_add]
+);
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR - (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = elemwise_sub,
+    COMMUTATOR = -
+    );
+    "#,
+    name = "elemwise_sub_operator",
+    requires = ["concrete_type", elemwise_sub]
+);
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR * (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = elemwise_mul,
+    COMMUTATOR = *
+    );
+    "#,
+    name = "elemwise_mul_operator",
+    requires = ["concrete_type", elemwise_mul]
+);
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR / (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = elemwise_div,
+    COMMUTATOR = /
+    );
+    "#,
+    name = "elemwise_div_operator",
+    requires = ["concrete_type", elemwise_div]
+);
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_exp(t: Tensor) -> Tensor {
+    Tensor::exp(t)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_ln(t: Tensor) -> Tensor {
+    Tensor::ln(t)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_powf(t: Tensor, exp: f32) -> Tensor {
+    Tensor::powf(t, exp)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_powi(t: Tensor, exp: i32) -> Tensor {
+    Tensor::powi(t, exp)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR ^ (
+    LEFTARG = tensor, RIGHTARG = integer, PROCEDURE = tensor_powi,
+    COMMUTATOR = /
+    );
+    "#,
+    name = "tensor_powi_operator",
+    requires = ["concrete_type", tensor_powi]
+);
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_dotf(t1: Tensor, t2: Tensor) -> f64 {
+    Tensor::dotf(t1, t2)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_doti(t1: Tensor, t2: Tensor) -> i64 {
+    Tensor::doti(t1, t2)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_matvec(m: Tensor, v: Tensor) -> Tensor {
+    Tensor::matvec(m, v)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR @> (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = tensor_matvec,
+    COMMUTATOR = @>
+    );
+    "#,
+    name = "tensor_matvec_operator",
+    requires = ["concrete_type", tensor_matvec]
+);
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_vecmat(v: Tensor, m: Tensor) -> Tensor {
+    Tensor::vecmat(v, m)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR <@ (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = tensor_vecmat,
+    COMMUTATOR = <@
+    );
+    "#,
+    name = "tensor_vecmat_operator",
+    requires = ["concrete_type", tensor_vecmat]
+);
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe, requires = ["concrete_type"])]
+pub fn tensor_matmul(t1: Tensor, t2: Tensor) -> Tensor {
+    Tensor::matmul(t1, t2)
+        .map_err(|err| pgrx::error!("{}", err))
+        .unwrap()
+}
+
+extension_sql!(
+    r#"
+    CREATE OPERATOR @ (
+    LEFTARG = tensor, RIGHTARG = tensor, PROCEDURE = tensor_matmul,
+    COMMUTATOR = @
+    );
+    "#,
+    name = "tensor_matmul_operator",
+    requires = ["concrete_type", tensor_matmul]
+);

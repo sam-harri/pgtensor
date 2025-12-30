@@ -72,7 +72,7 @@ mod tests {
     #[pg_test]
     fn test_elemwise_addition() -> Result<(), Box<dyn Error>> {
         let t_output: tensor_core::Tensor = Spi::get_one::<tensor_core::Tensor>(
-            "SELECT elemwise_add('[[1,2.0],[3,4]]', '[[10,20.0],[30,40]]');",
+            "SELECT '[[1,2.0],[3,4]]'::tensor + '[[10,20.0],[30,40]]'::tensor;",
         )?
         .ok_or("elemwise_add returned NULL")?;
 
@@ -85,11 +85,88 @@ mod tests {
     #[pg_test]
     fn test_elemwise_multiplication() -> Result<(), Box<dyn Error>> {
         let t_output: tensor_core::Tensor = Spi::get_one::<tensor_core::Tensor>(
-            "SELECT elemwise_mul('[[1,2.0],[3,4]]', '[[10,20.0],[30,40]]');",
+            "SELECT '[[1,2.0],[3,4]]'::tensor * '[[10,20.0],[30,40]]'::tensor;",
         )?
         .ok_or("elemwise_mul returned NULL")?;
 
         let t_expected = "[[10,40],[90,160]]".parse::<tensor_core::Tensor>()?;
+        assert_eq!(t_expected, t_output);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    fn test_tensor_exp() -> Result<(), Box<dyn Error>> {
+        let t_output: tensor_core::Tensor =
+            Spi::get_one::<tensor_core::Tensor>("SELECT tensor_exp('[[1,2],[3,4]]')")?
+                .ok_or("tensor_exp returned NULL")?;
+
+        let t_expected = Tensor {
+            dims: vec![2, 2],
+            strides: vec![2, 1],
+            elem_buffer: TensorElemBuffer::F64(vec![
+                1_f64.exp(),
+                2_f64.exp(),
+                3_f64.exp(),
+                4_f64.exp(),
+            ]),
+        };
+        assert_eq!(t_expected, t_output);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    fn test_tensor_ln() -> Result<(), Box<dyn Error>> {
+        let t_output: tensor_core::Tensor =
+            Spi::get_one::<tensor_core::Tensor>("SELECT tensor_ln('[[1,2],[3,4]]')")?
+                .ok_or("tensor_ln returned NULL")?;
+
+        let t_expected = Tensor {
+            dims: vec![2, 2],
+            strides: vec![2, 1],
+            elem_buffer: TensorElemBuffer::F64(vec![
+                1_f64.ln(),
+                2_f64.ln(),
+                3_f64.ln(),
+                4_f64.ln(),
+            ]),
+        };
+        assert_eq!(t_expected, t_output);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    fn test_tensor_powi() -> Result<(), Box<dyn Error>> {
+        let t_output: tensor_core::Tensor =
+            Spi::get_one::<tensor_core::Tensor>("SELECT '[[1,2],[3,4]]'::tensor ^ 3")?
+                .ok_or("tensor_powi returned NULL")?;
+
+        let t_expected = "[[1,8],[27,64]]".parse::<tensor_core::Tensor>()?;
+        assert_eq!(t_expected, t_output);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    fn test_tensor_dotf() -> Result<(), Box<dyn Error>> {
+        let t_output = Spi::get_one::<f64>("SELECT tensor_dotf('[1, 2, 3]', '[1, 2, 3]')")?
+            .ok_or("tensor_powi returned NULL")?;
+
+        assert_eq!(14.0, t_output);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    fn test_tensor_matmul() -> Result<(), Box<dyn Error>> {
+        let t_output: tensor_core::Tensor = Spi::get_one::<tensor_core::Tensor>(
+            "SELECT '[[1,2,3],[4,5,6]]'::tensor @ '[[1,2],[3,4],[5,6]]'::tensor",
+        )?
+        .ok_or("tensor_matmul returned NULL")?;
+
+        let t_expected = "[[22.0,28.0],[49.0,64.0]]".parse::<tensor_core::Tensor>()?;
         assert_eq!(t_expected, t_output);
 
         Ok(())
