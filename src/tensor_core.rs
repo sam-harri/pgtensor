@@ -5,7 +5,7 @@ use paste::paste;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number as JNumber, Value as JValue};
 use std::convert::TryFrom;
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Write};
 use std::ops::{Add, Div, Mul, Sub};
 use std::str::FromStr;
 use std::string::String;
@@ -404,6 +404,13 @@ impl From<Tensor> for String {
             F(v) => write_recursive(&mut s, &v, &t.dims, write_float),
             I(v) => write_recursive(&mut s, &v, &t.dims, write_int),
         });
+        match t.elem_buffer {
+            TensorElemBuffer::F16(_) => s.write_str("::f16"),
+            TensorElemBuffer::F32(_) => s.write_str("::f32"),
+            TensorElemBuffer::F64(_) => s.write_str("::f64"),
+            TensorElemBuffer::I32(_) => s.write_str("::i32"),
+            TensorElemBuffer::I64(_) => s.write_str("::i64"),
+        };
         s
     }
 }
@@ -420,7 +427,7 @@ mod tests {
         assert_eq!(t.strides, vec![1]);
 
         let s: String = t.into();
-        assert_eq!(s, "[1.0,2.0,3.5,4.0]".to_owned());
+        assert_eq!(s, "[1.0,2.0,3.5,4.0]::f64".to_owned());
         Ok(())
     }
 
@@ -431,7 +438,7 @@ mod tests {
         assert_eq!(t.strides, vec![3, 1]);
 
         let s: String = t.into();
-        assert_eq!(s, "[[1.0,2.0,3.0],[4.0,5.0,6.0]]".to_owned());
+        assert_eq!(s, "[[1.0,2.0,3.0],[4.0,5.0,6.0]]::f64".to_owned());
         Ok(())
     }
 
@@ -444,7 +451,7 @@ mod tests {
         let s: String = t.into();
         assert_eq!(
             s,
-            "[[[1.0,2.0],[3.0,4.0]],[[5.0,6.0],[7.0,8.0]]]".to_owned()
+            "[[[1.0,2.0],[3.0,4.0]],[[5.0,6.0],[7.0,8.0]]]::f64".to_owned()
         );
         Ok(())
     }
@@ -456,7 +463,7 @@ mod tests {
         let c = Tensor::elemwise_add(&a, &b)?;
         assert_eq!(
             Into::<String>::into(c),
-            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
+            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]::f64"
         );
         Ok(())
     }
@@ -464,12 +471,11 @@ mod tests {
     #[test]
     fn elemwise_add_f16_rank2() -> Result<(), Box<dyn Error>> {
         let a = "[[1,2,3],[4,5,6]]::f16".parse::<Tensor>()?;
-        assert!(matches!(a.elem_buffer, TensorElemBuffer::F16(_)));
         let b = "[[10,20,30],[40,50,60]]::f16".parse::<Tensor>()?;
         let c = Tensor::elemwise_add(&a, &b)?;
         assert_eq!(
             Into::<String>::into(c),
-            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]"
+            "[[11.0,22.0,33.0],[44.0,55.0,66.0]]::f16"
         );
         Ok(())
     }
@@ -477,10 +483,9 @@ mod tests {
     #[test]
     fn elemwise_add_i32_rank2() -> Result<(), Box<dyn Error>> {
         let a = "[[1,2,3],[4,5,6]]::i32".parse::<Tensor>()?;
-        assert!(matches!(a.elem_buffer, TensorElemBuffer::I32(_)));
         let b = "[[10,20,30],[40,50,60]]::i32".parse::<Tensor>()?;
         let c = Tensor::elemwise_add(&a, &b)?;
-        assert_eq!(Into::<String>::into(c), "[[11,22,33],[44,55,66]]");
+        assert_eq!(Into::<String>::into(c), "[[11,22,33],[44,55,66]]::i32");
         Ok(())
     }
 
