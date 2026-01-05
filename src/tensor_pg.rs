@@ -1,7 +1,7 @@
 // postgres glue for the tensor_core interface
-use crate::tensor_core::{self, Tensor};
+use crate::tensor_core::{self, Tensor, TensorElemType};
 use arbitrary_int::traits::Integer;
-use arbitrary_int::{u10, u26, u31, u4, TryNewError};
+use arbitrary_int::{u23, u31, u4, u7, TryNewError};
 use bitbybit::bitfield;
 use core::ffi::CStr;
 use half::f16;
@@ -23,26 +23,28 @@ use std::str::FromStr;
 struct Typmod {
     #[bits(27..=30, rw)]
     ndims: u4,
+    #[bits(24..=26, rw)]
+    dtype: Option<TensorElemType>,
     // TODO: Could add in a third option here to store exact dimensions... not
     // sure how likely that is to be used though, and whether we want to pay the
     // extra bit for that for all other tensors that don't use it.
-    #[bit(26, rw)]
+    #[bit(23, rw)]
     exact_nelems: bool,
-    #[bits(0..=25, rw)]
-    rest_bits: u26,
+    #[bits(0..=22, rw)]
+    rest_bits: u23,
 }
 
 enum TypemodRest {
     ExactNElems(TypmodRestExactNElems),
-    FullHash(u26),
+    FullHash(u23),
 }
 
-#[bitfield(u26)]
+#[bitfield(u23)]
 struct TypmodRestExactNElems {
-    #[bits(10..=25, rw)]
+    #[bits(7..=22, rw)]
     nelems: u16,
-    #[bits(0..=9, rw)]
-    hash: u10,
+    #[bits(0..=6, rw)]
+    hash: u7,
 }
 
 impl Typmod {
@@ -62,7 +64,11 @@ impl Typmod {
     // Try to convert the raw typmod value into a structured Typmod value.
     fn try_unpack(raw: i32) -> Option<Typmod> {
         let raw = u32::try_from(raw).ok()?;
-        Some(Typmod::new_with_raw_value(u31::new(raw)))
+        let typmod = Typmod::new_with_raw_value(u31::new(raw));
+        if typmod.dtype().is_err() {
+            return None;
+        }
+        Some(typmod)
     }
 
     fn unpack_unchecked(raw: i32) -> Typmod {
@@ -75,6 +81,14 @@ impl Typmod {
                 "ndims mismatch, expected {}, found {}",
                 self.ndims(),
                 tensor.dims.len()
+            );
+        }
+
+        if self.dtype().unwrap() != tensor.elem_type() {
+            pgrx::error!(
+                "dtype mismatch, expected {}, found {}",
+                self.dtype().unwrap(),
+                tensor.elem_type()
             );
         }
 
@@ -92,7 +106,7 @@ impl Typmod {
                     );
                 }
 
-                let actual_hash = u10::extract_u64(hash, 0);
+                let actual_hash = u7::extract_u64(hash, 0);
                 if actual_hash != rest.hash() {
                     pgrx::error!(
                         "dimension hash mismatch, potentially incorrect dimensions, expected {:#x}, found {:#x}",
@@ -102,7 +116,7 @@ impl Typmod {
                 }
             }
             TypemodRest::FullHash(expected_hash) => {
-                let actual_hash = u26::extract_u64(hash, 0);
+                let actual_hash = u23::extract_u64(hash, 0);
                 if actual_hash != expected_hash {
                     pgrx::error!(
                         "dimension hash mismatch, potentially incorrect nelems or dimensions, expected {:#x}, found {:#x}",
@@ -119,9 +133,16 @@ impl ToString for Typmod {
     fn to_string(&self) -> String {
         match self.rest() {
             TypemodRest::ExactNElems(rest) => {
-                format!("ndims={} nelems={}", self.ndims(), rest.nelems())
+                format!(
+                    "ndims={} dtype={} nelems={}",
+                    self.ndims(),
+                    self.dtype().unwrap(),
+                    rest.nelems()
+                )
             }
-            TypemodRest::FullHash(_) => format!("ndims={}", self.ndims()),
+            TypemodRest::FullHash(_) => {
+                format!("ndims={} dtype={}", self.ndims(), self.dtype().unwrap())
+            }
         }
     }
 }
@@ -261,6 +282,25 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
         .map(|c| c.unwrap().to_str().unwrap().trim())
         .collect();
 
+    let dtype = if let Some(&s) = parts.last() {
+        let dtype = match s {
+            "f16" => Some(TensorElemType::F16),
+            "f32" => Some(TensorElemType::F32),
+            "f64" => Some(TensorElemType::F64),
+            "i32" => Some(TensorElemType::I32),
+            "i64" => Some(TensorElemType::I64),
+            _ => None,
+        };
+        if let Some(dtype) = dtype {
+            parts.pop();
+            dtype
+        } else {
+            TensorElemType::F64
+        }
+    } else {
+        TensorElemType::F64
+    };
+
     if parts.is_empty() {
         pgrx::error!("tensor(...) requires at least one dimension");
     }
@@ -279,7 +319,7 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
         .and_then(|ndims| u4::try_new(ndims).ok())
         .unwrap_or_else(|| pgrx::error!("too many dimensions (max 15)"));
 
-    let builder = Typmod::builder().with_ndims(ndims);
+    let builder = Typmod::builder().with_ndims(ndims).with_dtype(dtype);
 
     let mut hasher = DefaultHasher::new();
     dims.hash(&mut hasher);
@@ -290,7 +330,7 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
     }) else {
         return builder
             .with_exact_nelems(false)
-            .with_rest_bits(u26::extract_u64(hash, 0))
+            .with_rest_bits(u23::extract_u64(hash, 0))
             .build()
             .raw_value()
             .value()
@@ -302,7 +342,7 @@ fn tensor_modifier_input(list: pgrx::datum::Array<&CStr>) -> i32 {
         .with_rest_bits(
             TypmodRestExactNElems::builder()
                 .with_nelems(nelems)
-                .with_hash(u10::extract_u64(hash, 0))
+                .with_hash(u7::extract_u64(hash, 0))
                 .build()
                 .raw_value(),
         )

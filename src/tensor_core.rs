@@ -1,3 +1,4 @@
+use bitbybit::bitenum;
 // core tensor API, no postgres leakage (or at least as much as possible)
 use half::f16;
 use num_traits::{Float, Num, One, Zero};
@@ -108,7 +109,8 @@ macro_rules! tensor_map {
 }
 pub(crate) use tensor_map;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, PartialEq)]
+#[bitenum(u3)]
 pub enum TensorElemType {
     F16,
     F32,
@@ -116,6 +118,7 @@ pub enum TensorElemType {
     I32,
     I64,
 }
+
 macro_rules! tensor_elemtype_to_buffer {
     ($ty:expr, $b:expr) => {
         match $ty {
@@ -126,6 +129,18 @@ macro_rules! tensor_elemtype_to_buffer {
             TensorElemType::I64 => TensorElemBuffer::I64($b),
         }
     };
+}
+
+impl Display for TensorElemType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TensorElemType::F16 => f.write_str("f16"),
+            TensorElemType::F32 => f.write_str("f32"),
+            TensorElemType::F64 => f.write_str("f64"),
+            TensorElemType::I32 => f.write_str("i32"),
+            TensorElemType::I64 => f.write_str("i64"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -159,6 +174,16 @@ macro_rules! tensor_elemwise_op {
 impl Tensor {
     pub fn len(&self) -> usize {
         tensor_reduce!(self, |v| v.len())
+    }
+
+    pub fn elem_type(&self) -> TensorElemType {
+        match self.elem_buffer {
+            TensorElemBuffer::F16(_) => TensorElemType::F16,
+            TensorElemBuffer::F32(_) => TensorElemType::F32,
+            TensorElemBuffer::F64(_) => TensorElemType::F64,
+            TensorElemBuffer::I32(_) => TensorElemType::I32,
+            TensorElemBuffer::I64(_) => TensorElemType::I64,
+        }
     }
 
     tensor_elemwise_op!(add, Add::add);
