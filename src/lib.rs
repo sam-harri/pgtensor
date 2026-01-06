@@ -29,8 +29,15 @@ mod tests {
         Ok(())
     }
 
+    #[pg_test(error = "dtype mismatch, expected i32, found i64")]
+    fn test_dtype_mismatch() -> Result<(), Box<dyn Error>> {
+        Spi::run("CREATE TABLE t (x tensor(2,3,i32));")?;
+        Spi::run("INSERT INTO t VALUES ('[[0,1],[2,2],[3,4]]::i64');")?;
+        Ok(())
+    }
+
     #[pg_test(
-        error = "dimension hash mismatch, potentially incorrect dimensions, expected 0x1c7, found 0x14c"
+        error = "dimension hash mismatch, potentially incorrect dimensions, expected 0x47, found 0x4c"
     )]
     fn test_typmod_hash() -> Result<(), Box<dyn Error>> {
         Spi::run("CREATE TABLE t (x tensor(2,3));")?;
@@ -58,7 +65,7 @@ mod tests {
             "#,
         )?
         .unwrap();
-        assert_eq!(typ, "tensor(ndims=1 nelems=1)");
+        assert_eq!(typ, "tensor(ndims=1 dtype=f64 nelems=1)");
         Ok(())
     }
 
