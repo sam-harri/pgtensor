@@ -4,13 +4,13 @@ Open-source Postgres extension that adds a `tensor`  type, and an ONNX inference
 
 -   Define columns like `tensor(2,3)`
 -   Insert with simple literals like `'[[0,1,2],[2,3,4]]'`, and validate shapes
+-   Support for f16, f32, f64, i32, and i64 entry datatypes.
+-   Various tensor operations accessible in SQL via functions and inline operators (i.e. `+`, `-`, `@`, etc.)
 -   Load ONNX models into background processes, and run inference on stored tensors
 -   Compatible with Postgres versions 13-17
 
 ## Roadmap 
-- [ ] Support multiple dtype tensors (f16, f32, i32, i64), currently only supporting f64
 - [ ] Flexible `tensor` column type supporting different lengths and dtypes in the same column
-- [ ] Support tensor operations, and vector opertions for Rank 1 tensors
 - [ ] Better synchronization, move from 1 lock for the entire shared memory queue to a lock per slot in queue
 
 ## API overview
